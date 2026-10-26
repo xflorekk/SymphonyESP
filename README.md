@@ -18,7 +18,16 @@ Modular, ESP32-powered Wi-Fi & Bluetooth audio node with MultiRoom and spatial s
 ## Architecture & Block Diagram
 
 ## Electric Schematic & Pinout
+### Electric Schematic
 
+### Pinout
+| PIN_1 | Device_1 | PIN_2 | Device_2 |
+| :---: | :---: | :---: | :---: |
+| VCC | ESP32 | 5V | - |
+| GND | ESP32 |  | - |
+|  | ESP32 |  |  | 
+|  | ESP32 |  |  |
+|  | ESP32 |  |  |
 ## Hardware Requirements (BOM)
  - ESP32
 
