@@ -30,6 +30,7 @@ Modular, ESP32-powered Wi-Fi & Bluetooth audio node with MultiRoom and spatial s
 |  | ESP32 |  |  |
 ## Hardware Requirements (BOM)
  - ESP32
+ - SSD1315 OLED Screen
 
 ## Used systems & protocols
  - MultiRoom Protocol
