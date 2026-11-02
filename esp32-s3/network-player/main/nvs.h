@@ -1,0 +1,8 @@
+#ifndef NVS_H
+#define NVS_H
+
+#include <esp_err.h>
+
+esp_err_t nvs_init(void);
+
+#endif
