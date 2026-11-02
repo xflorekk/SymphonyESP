@@ -105,6 +105,25 @@ tcp_cli_t *tcp_cli_get_next(tcp_cli_t *prev) {
   return next;
 }
 
+tcp_cli_t *tcp_cli_find_by_fd(int fd) {
+  if (fd < 0) {
+    return NULL;
+  }
+  if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+    return NULL;
+  }
+  tcp_cli_t *found = NULL;
+
+  for (int i = 0; i < TCP_MAX_CLIENTS; i++) {
+    if (s_clients[i].state != TCP_CLI_STATE_FREE && s_clients[i].fd == fd) {
+      found = &s_clients[i];
+      break;
+    }
+  }
+  xSemaphoreGive(s_lock);
+  return found;
+}
+
 int tcp_cli_fill_fdset(fd_set *set, int *max_fd) {
   int cnt = 0;
   if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE)
