@@ -1,10 +1,4 @@
-import socket
-import threading
-import json
-import time
-
-HOST = "10.0.1.220"
-PORT = 3333
+import socket, threading, json, time, argparse
 
 URLS = [
     "http://ice1.somafm.com/groovesalad-128-mp3",
@@ -17,15 +11,15 @@ def rx_loop(s):
     s.settimeout(0.5)
     while True:
         try:
-            data = s.recv(1024).decode('utf-8', errors='ignore')
+            data = s.recv(4096).decode('utf-8', errors='ignore')
             if not data:
-                print("\n[TCP] rozłączono przez serwer")
+                print("\n[TCP] rozłączono")
                 break
             buf += data
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
-                if not line.strip(): continue
-                print(f"<< RX: {line}")
+                if line.strip():
+                    print(f"<< RX: {line}")
         except socket.timeout:
             continue
         except Exception as e:
@@ -37,43 +31,33 @@ def send_line(s, obj):
     s.sendall(line.encode())
     print(f">> TX: {line.strip()}")
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.connect((HOST, PORT))
-print(f"Połączono {HOST}:{PORT}")
+parser = argparse.ArgumentParser(description="TCP JSON client dla SymphonyESP")
+parser.add_argument("ip", nargs="?", default="10.0.1.220", help="IP ESP32")
+parser.add_argument("-p", "--port", type=int, default=3333, help="port TCP")
+args = parser.parse_args()
 
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((args.ip, args.port))
+print(f"Połączono {args.ip}:{args.port}")
 threading.Thread(target=rx_loop, args=(s,), daemon=True).start()
 time.sleep(0.5)
 
 while True:
-    print("\n--- MENU ---")
-    print("1 - get_state")
-    print("2 - set_vol")
-    print("3 - set_url / play")
-    print("4 - stop")
-    print("5 - next")
-    print("q - quit")
+    print("\n--- MENU ---\n1-get_state 2-set_vol 3-set_url/play 4-stop 5-next q-quit")
     ch = input("wybierz> ").strip()
-
-    if ch == "1":
-        send_line(s, {"cmd":"get_state"})
+    if ch == "1": send_line(s, {"cmd":"get_state"})
     elif ch == "2":
         v = input("vol 0-100> ").strip()
-        try:
-            send_line(s, {"cmd":"set_vol","value":int(v)})
-        except: print("zły vol")
+        if v.isdigit(): send_line(s, {"cmd":"set_vol","value":int(v)})
     elif ch == "3":
-        print("URLS:")
         for i,u in enumerate(URLS): print(f" {i}: {u}")
-        idx = input("idx lub własny url> ").strip()
+        idx = input("idx lub url> ").strip()
         url = URLS[int(idx)] if idx.isdigit() and int(idx) < len(URLS) else idx
         send_line(s, {"cmd":"set_url","url":url})
         time.sleep(0.2)
         send_line(s, {"cmd":"play"})
-    elif ch == "4":
-        send_line(s, {"cmd":"stop"})
-    elif ch == "5":
-        send_line(s, {"cmd":"next"})
-    elif ch == "q":
-        break
+    elif ch == "4": send_line(s, {"cmd":"stop"})
+    elif ch == "5": send_line(s, {"cmd":"next"})
+    elif ch == "q": break
 
 s.close()
