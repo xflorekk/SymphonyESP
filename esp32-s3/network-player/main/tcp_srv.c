@@ -1,5 +1,6 @@
 #include "tcp_srv.h"
 #include "app.h"
+#include "json.h"
 #include "tcp_cli.h"
 #include <errno.h>
 #include <esp_log.h>
@@ -44,6 +45,20 @@ static int tcp_srv_handle_clients(fd_set *read_fds) {
           char line[TCP_RX_BUF_SIZE];
           while (tcp_cli_extract_line(cli, line, sizeof(line)) > 0) {
             ESP_LOGI(TAG, "RX fd=%d: %s", cli->fd, line);
+
+            app_cmd_t cmd;
+            if (json_parse(line, &cmd) != 0) {
+              char err[128];
+              json_build_error(err, sizeof(err), "invalid json");
+              send(cli->fd, err, strlen(err), 0);
+              continue;
+            }
+            cmd.src_fd = cli->fd;
+            if (app_send_cmd(&cmd) != 0) {
+              char err[128];
+              json_build_error(err, sizeof(err), "queue full");
+              send(cli->fd, err, strlen(err), 0);
+            }
           }
         }
       }
@@ -57,19 +72,6 @@ static int tcp_srv_handle_clients(fd_set *read_fds) {
 }
 
 static void tcp_srv_task(void *pvParameters) {
-
-  /*TODO:
-    define the role of the server!
-    how does one handle clients?
-    what data structures are being used?
-  */
-
-  /*
-    TASK:
-    Receive and parse data, send data to app_queue
-    Register new clients, remove clients
-  */
-
   // 1. INIT
   // socket()
   // bind()
@@ -235,6 +237,46 @@ int tcp_srv_stop(void) {
   return 0;
 }
 
-int tcp_srv_broadcast(const char *json_data) { return -1; }
+int tcp_srv_broadcast(const char *json) {
+  if (!json) {
+    return -1;
+  }
+  size_t len = strlen(json);
+  int cnt = 0;
 
-int tcp_serv_send_error(const char *json_data) { return -1; }
+  tcp_cli_t *cli = tcp_cli_get_next(NULL);
+
+  while (cli) {
+    tcp_cli_t *next = tcp_cli_get_next(cli);
+    int n = send(cli->fd, json, len, 0);
+    ESP_LOGI(TAG, "bcast to fd=%d n=%d err=%d", cli->fd, n, n < 0 ? errno : 0);
+    if (n >= 0) {
+      cnt++;
+    } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+      tcp_cli_remove(cli);
+    }
+    cli = next;
+  }
+  return cnt;
+}
+
+int tcp_srv_unicast(int fd, const char *json) {
+  if (fd < 0 || !json) {
+    return -1;
+  }
+
+  tcp_cli_t *cli = tcp_cli_find_by_fd(fd);
+  if (!cli) {
+    return -1;
+  }
+
+  int n = send(cli->fd, json, strlen(json), 0);
+  if (n < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
+    tcp_cli_remove(cli);
+  }
+  return n;
+}
+
+int tcp_serv_send_error(int fd, const char *json) {
+  return tcp_srv_unicast(fd, json);
+}

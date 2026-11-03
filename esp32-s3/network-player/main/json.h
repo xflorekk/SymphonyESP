@@ -2,15 +2,20 @@
 #define JSON_H
 
 /* TODO:
-    parsing and writing into json format needs to be unified
-    accross the client and server app, it means the commands that server handles
-    and the ones handled by client are the same.
-    write separate code for handling commands, that can be later used in other
-    applications.
-    understand the purpose of parse and write
+    JSON parsing
 */
+#include "app.h"
+#include "app_types.h"
+#include <stddef.h>
 
-int json_parse(void);
-char *json_write(void);
+int json_parse(const char *line, app_cmd_t *out);
+
+// state send after logging
+// error if fail in any process
+// send broadcast about changed information
+int json_build_state(char *out, size_t out_size, const app_state_t *st);
+int json_build_error(char *out, size_t out_size, const char *msg);
+int json_build_broadcast(char *out, size_t out_size, const app_state_t *st,
+                         app_cmd_type_t changed);
 
 #endif
