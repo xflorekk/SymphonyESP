@@ -1,5 +1,6 @@
 #include "app.h"
 #include "nvs.h"
+#include "player.h"
 #include "tcp_cli.h"
 #include "tcp_srv.h"
 #include "wifi.h"
@@ -14,6 +15,7 @@ void app_main(void) {
   nvs_init();
   wifi_init();
 
+  player_init();
   tcp_srv_init();
   app_init();
 

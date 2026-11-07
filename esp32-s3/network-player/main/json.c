@@ -82,6 +82,45 @@ int json_parse(const char *line, app_cmd_t *out) {
     extract_int(line, "\"value\"", &out->value);
     return 0;
   }
+  if (strcmp(cmd, "set_src") == 0) {
+    char src_str[32] = {0};
+
+    if (extract_string(line, "\"src\"", src_str, sizeof(src_str)) == 0) {
+      if (strcmp(src_str, "net_radio") == 0) {
+        out->type = APP_CMD_SET_SRC_NET_RADIO;
+      } else if (strcmp(src_str, "net_server") == 0) {
+        out->type = APP_CMD_SET_SRC_NET_SERVER;
+      } else if (strcmp(src_str, "bt") == 0) {
+        out->type = APP_CMD_SET_SRC_BT;
+      } else {
+        return -1;
+      }
+      return 0;
+
+      // fallback: {"cmd":"set_src","value":1
+      int val = -1;
+      if (extract_int(line, "\"value\"", &val) == 0) {
+        switch (val) {
+        case 0:
+          out->type = APP_CMD_SET_SRC_NET_RADIO;
+          break;
+
+        case 1:
+          out->type = APP_CMD_SET_SRC_NET_SERVER;
+          break;
+
+        case 2:
+          out->type = APP_CMD_SET_SRC_BT;
+          break;
+
+        default:
+          return -1;
+          break;
+        }
+        return 0;
+      }
+    }
+  }
   if (strcmp(cmd, "set_url") == 0) {
     out->type = APP_CMD_SET_URL;
     extract_string(line, "\"url\"", out->data, sizeof(out->data));
@@ -94,11 +133,12 @@ int json_build_state(char *out, size_t out_size, const app_state_t *st) {
   if (!out || !st) {
     return -1;
   }
-  return snprintf(out, out_size,
-                  "{\"type\":\"state\",\"vol\":%d,\"playing\":%s,\"url\":\"%"
-                  "s\",\"title\":\"%s\",\"artist\":\"%s\"}\n",
-                  st->volume, st->is_playing ? "true" : "false", st->url,
-                  st->title, st->artist);
+  return snprintf(
+      out, out_size,
+      "{\"type\":\"state\",\"vol\":%d,\"src\":%d,\"playing\":%s,\"url\":\"%"
+      "s\",\"title\":\"%s\",\"artist\":\"%s\"}\n",
+      st->volume, st->src, st->is_playing ? "true" : "false", st->url,
+      st->title, st->artist);
 }
 
 int json_build_error(char *out, size_t out_size, const char *msg) {
