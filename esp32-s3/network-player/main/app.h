@@ -4,30 +4,6 @@
 #include "app_types.h"
 #include <stdbool.h>
 
-typedef struct {
-  app_cmd_type_t type;
-  int src_fd;
-  int value;
-  char data[256];
-} app_cmd_t;
-
-typedef enum {
-  APP_SRC_NONE = 0,
-  APP_SRC_NET_RDO,
-  APP_SRC_NET_SRV,
-  APP_SRC_BT_RCV,
-} app_src_t;
-
-typedef struct {
-  int volume;
-  bool is_muted;
-  bool is_playing;
-  char url[256];
-  char title[128];
-  char artist[128];
-  app_src_t src;
-} app_state_t;
-
 typedef struct app_obj *app_handle_t;
 
 int app_init(void);
