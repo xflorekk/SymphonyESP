@@ -31,8 +31,8 @@ void app_main(void) {
       .auto_reconnect = true,
       .max_retry = 5,
       .mode = WIFI_MODE_STA,
-      .password = "28567911",
-      .ssid = "fiberway.pl_6c",
+      .password = "XXX",
+      .ssid = "XXX",
       .ps = WIFI_PS_NONE,
   };
 
