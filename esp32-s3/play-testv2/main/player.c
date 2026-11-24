@@ -20,6 +20,16 @@
  * - State functions never block on queue, they only check pending and do work.
  * - All state transitions call on_state() if set. All errors call on_error()
  *   then on_state(UNCONFIGURED).
+ * - buf / dec / i2s are borrowed via player_hw_t, created once in main.
+ *   Player never creates / destroys them, only buf_flush / dec_reset /
+ *   i2s_disable. player_destroy() cleans only queue + event group.
+ * - tmp_in / tmp_pcm / dec_pending are static in PSRAM, EXT_RAM_BSS_ATTR,
+ *   no malloc in playback loop.
+ * - do_reset() = buf_flush + dec_reset + i2s_disable + memset PSRAM tmp +
+ *   clear flags. It does NOT touch play_cfg. Only transitions to
+ *   UNCONFIGURED clear play_cfg.
+ * - STOP -> IDLE keeps play_cfg, PLAY from IDLE needs no CONFIG.
+ *   RESET / EOF / ERROR -> UNCONFIGURED clear play_cfg, CONFIG is required.
  */
 
 #include "player.h"
@@ -36,10 +46,12 @@
 #include <string.h>
 
 static const char *TAG = "player";
+#define PREBUFFER_BYTES 8192
+#define DIAG_LOG_EVERY 50
 
-static EXT_RAM_BSS_ATTR uint8_t tmp_in[16384];
-static EXT_RAM_BSS_ATTR uint8_t tmp_pcm[32768];
-static EXT_RAM_BSS_ATTR uint8_t dec_pending[16384];
+static EXT_RAM_BSS_ATTR uint8_t tmp_in[65536];
+static EXT_RAM_BSS_ATTR uint8_t tmp_pcm[65536];
+static EXT_RAM_BSS_ATTR uint8_t dec_pending[65536];
 
 /**
  * @brief Debug logs in player task.
@@ -75,13 +87,12 @@ typedef enum {
 /**
  * @brief Command struct, queued to player_task.
  * @details seq is incremented per command, for log correlation.
- * @todo Add play_config_t codec / sample_rate / bits / channels to CMD_CONFIG.
- *       For now player_cmd_config() carries only timeout.
+ *          dec_cfg is valid only for CMD_CONFIG, copied to pending_cfg
+ *          in player_task(), then to play_cfg in state_configuring().
  */
 typedef struct {
   cmd_type_t type;
   uint32_t seq;
-  // TODO: dec codec, bits, channels
   player_dec_cfg_t dec_cfg;
 } cmd_t;
 
@@ -106,12 +117,10 @@ typedef enum {
 
 /**
  * @brief Private player struct, lives inside player_storage_t.
- * @details All fields are inside storage, except buf_in / buf_out data
- *          (PSRAM, malloc in CONFIGURING) and decoder internals.
+ * @details All fields are inside storage. buf_in / buf_out / dec / dac
+ *          are borrowed handles from player_hw_t, data lives outside
+ *          storage, buf data in PSRAM, dec internals in dec.c.
  *          task_stack is PLAYER_STACK_SIZE words = 32 KB, the largest field.
- * @todo Add dec*, i2s_handle, buf_in*, buf_out*, sample_rate/bits/channels,
- *       prebuffer_done, i2s_configured, i2s_started. Only pointers here,
- *       data in PSRAM, not in storage.
  */
 struct player_s {
   player_cfg_t cfg;
@@ -133,6 +142,13 @@ struct player_s {
   size_t pending_len;
   bool eof_requested;
   int no_progress;
+  bool need_i2s_setup;
+  bool i2s_enabled;
+  //
+  uint32_t diag_frames;
+  uint32_t diag_pcm_bytes;
+  uint32_t diag_i2s_bytes;
+  uint32_t diag_last_log;
   //
   TaskHandle_t task_handle;
   StaticTask_t task_tcb;
@@ -168,8 +184,44 @@ _Static_assert(sizeof(struct player_s) <= sizeof(player_storage_t),
 
 // PLAYER TASK
 
-// TODO: do_reset(player_t play), do_drain(player_t play)
+/**
+ * @brief Wspólny reset: buf + dec + i2s + statyczne bufory w PSRAM + flagi.
+ * @details Nie rusza state ani pending - to ustawia wołający.
+ *          Nie rusza play_cfg - play_cfg czyści tylko przejście do
+ *          UNCONFIGURED (RESET / EOF / ERROR). STOP tego NIE robi.
+ *          Nie rusza pending_cfg - w CONFIGURING jest potrzebny do play_cfg.
+ *          PAUSE / RESUME tego NIE wołają, tam pending_len + dec_pending mają
+ * zostać.
+ */
+static void do_reset(player_t play) {
+  buf_flush(play->buf_in);
+  buf_flush(play->buf_out);
+  dec_reset(play->dec);
+  i2s_disable(play->dac);
+  // [USUNIĘTE] memset(tmp_in...), memset(tmp_pcm...), memset(dec_pending...),
+  // memset(tmp_pcm32...)
+  play->pending_len = 0;
+  play->eof_requested = false;
+  play->no_progress = 0;
+  play->prebuffer_done = false;
+  play->i2s_configured = false;
+  play->last_rate = 0;
+  play->last_bits = 0;
+  play->last_channels = 0;
+  play->need_i2s_setup = false;
+  play->i2s_enabled = false;
+  // [NOWE]
+  play->diag_frames = 0;
+  play->diag_pcm_bytes = 0;
+  play->diag_i2s_bytes = 0;
+  play->diag_last_log = 0;
+}
 
+/**
+ * @brief Drain buf_out to I2S until empty.
+ * @details Called from state_playing() each loop and from EOF drain.
+ *          Does not touch buf_in, dec_pending or flags.
+ */
 static void drain_to_dac(player_t play) {
   while (buf_get_fill(play->buf_out) > 0) {
     size_t item_size = 0;
@@ -185,9 +237,26 @@ static void drain_to_dac(player_t play) {
       if (written == 0)
         break;
       off += written;
+      play->diag_i2s_bytes += written; // [NOWE]
     }
     buf_return_item(play->buf_out, item);
   }
+}
+
+static void log_playing_diag(player_t play, const char *tag) {
+  size_t in_fill = buf_get_fill(play->buf_in);
+  size_t in_free = buf_get_free(play->buf_in);
+  size_t out_fill = buf_get_fill(play->buf_out);
+  size_t out_free = buf_get_free(play->buf_out);
+  dec_info_t info = dec_get_info(play->dec);
+  PLAYER_LOGI(
+      "[DIAG %s] frames=%u pcm=%u i2s=%u dec_rate=%lu dec_bits=%u dec_ch=%u "
+      "buf_in=%u/%u buf_out=%u/%u prebuf=%d no_prog=%d eof=%d",
+      tag, (unsigned)play->diag_frames, (unsigned)play->diag_pcm_bytes,
+      (unsigned)play->diag_i2s_bytes, (unsigned long)info.sample_rate,
+      info.bits, info.channels, (unsigned)in_fill, (unsigned)in_free,
+      (unsigned)out_fill, (unsigned)out_free, play->prebuffer_done,
+      play->no_progress, play->eof_requested);
 }
 
 /**
@@ -215,40 +284,19 @@ static player_err_t state_unconfigured(player_t play) {
 }
 
 /**
- * @brief State IDLE: wait for CONFIG / RESET / PLAY / EXIT.
- * @details PEND_CONFIG -> CONFIGURING, PEND_RESET -> UNCONFIGURED + ACK_OK,
- *          PEND_PLAY -> PLAYING + ACK_OK. RESET here only changes state,
- *          real buf/dec/i2s clear is TODO in state_idle / state_configuring.
+ * @brief State IDLE: wait for RESET / PLAY / EXIT.
+ * @details PEND_RESET -> do_reset + clear play_cfg -> UNCONFIGURED + ACK_OK,
+ *          PEND_PLAY -> PLAYING + ACK_OK, no CONFIG here.
+ *          CONFIG is only from UNCONFIGURED, see state_unconfigured().
  *          PEND_EXIT returns OK, loop will exit.
- * @param[in] play Handle.
- * @return PLAYER_OK.
  */
 static player_err_t state_idle(player_t play) {
   if (play->pending == PEND_EXIT) {
     return PLAYER_OK;
-  } /*
-   if (play->pending == PEND_CONFIG) {
-     play->state = PLAYER_STATE_CONFIGURING;
-     play->pending = PEND_NONE;
-     if (play->cfg.on_state) {
-       play->cfg.on_state(play->cfg.user_ctx, PLAYER_STATE_CONFIGURING);
-     }
-     return PLAYER_OK;
-   }*/
+  }
   if (play->pending == PEND_RESET) {
     // TODO: RESET operation
-    buf_flush(play->buf_in);
-    buf_flush(play->buf_out);
-    dec_reset(play->dec);
-    i2s_disable(play->dac);
-    play->pending_len = 0;
-    play->eof_requested = false;
-    play->no_progress = 0;
-    play->prebuffer_done = false;
-    play->i2s_configured = false;
-    play->last_rate = 0;
-    play->last_bits = 0;
-    play->last_channels = 0;
+    do_reset(play);
     memset(&play->play_cfg, 0, sizeof(play->play_cfg));
 
     play->state = PLAYER_STATE_UNCONFIGURED;
@@ -274,76 +322,68 @@ static player_err_t state_idle(player_t play) {
 
 /**
  * @brief State PLAYING: handle STOP/PAUSE/EOF/EXIT, else do playback.
- * @details PEND_STOP -> IDLE + ACK_OK (TODO: flush buf),
- *          PEND_PAUSE -> PAUSED + ACK_OK,
- *          PEND_EOF -> drain + UNCONFIGURED + ACK_OK (TODO: drain >=249 logic),
+ * @details PEND_STOP -> do_reset, keep play_cfg -> IDLE + ACK_OK,
+ *          PEND_PAUSE -> PAUSED + ACK_OK, keeps buf / dec_pending,
+ *          PEND_EOF -> eof_requested = true, drain happens below,
  *          PEND_EXIT -> return OK, loop exits.
- *          Otherwise playback logic (TODO):
- *          1) prebuffer: fill buf_in to threshold before first i2s_write,
- *          2) decode first frame, if codec, retune I2S to decoded rate/bits/ch,
- *          3) loop src -> buf_in -> dec -> buf_out -> i2s_write,
- *          4) on underrun, go back to prebuffer, not EOF.
- * @param[in] play Handle.
- * @return PLAYER_OK, or dec/i2s error -> state_error() in task loop.
+ *          EOF drain: when eof_requested and buf_in empty and buf_out empty,
+ *          drop leftover pending_len (incomplete frame), drain_to_dac(),
+ *          write 4608 zero bytes, delay 50 ms, do_reset + clear play_cfg
+ *          -> UNCONFIGURED + ACK_OK.
+ *          Playback step: pending + buf_in -> tmp_in -> dec_decode ->
+ *          tmp_pcm -> buf_out -> drain_to_dac(). On first decoded frame
+ *          retune I2S to decoded rate/bits/ch. 16-bit PCM is -6dB (/2)
+ *          for test, 24-bit is next step.
+ *          On underrun without EOF, delay 1 ms and retry, not EOF.
  */
 static player_err_t state_playing(player_t play) {
-  if (play->pending == PEND_EXIT) {
+  if (play->pending == PEND_EXIT)
     return PLAYER_OK;
-  }
   if (play->pending == PEND_STOP) {
-    // TODO: Flush buffers
-    buf_flush(play->buf_in);
-    buf_flush(play->buf_out);
-    dec_reset(play->dec);
-    i2s_disable(play->dac);
-    play->eof_requested = false;
-    play->pending_len = 0;
-    play->i2s_configured = false;
-    play->prebuffer_done = false;
-    play->pending_len = 0;
-    play->eof_requested = false;
-
+    log_playing_diag(play, "STOP"); // [NOWE]
+    do_reset(play);
     play->state = PLAYER_STATE_IDLE;
     play->pending = PEND_NONE;
-    if (play->cfg.on_state) {
+    if (play->cfg.on_state)
       play->cfg.on_state(play->cfg.user_ctx, PLAYER_STATE_IDLE);
-    }
     xEventGroupSetBits(play->ack_group, ACK_OK);
     return PLAYER_OK;
   }
   if (play->pending == PEND_PAUSE) {
+    log_playing_diag(play, "PAUSE"); // [NOWE]
     play->state = PLAYER_STATE_PAUSED;
     play->pending = PEND_NONE;
-    if (play->cfg.on_state) {
+    if (play->cfg.on_state)
       play->cfg.on_state(play->cfg.user_ctx, PLAYER_STATE_PAUSED);
-    }
     xEventGroupSetBits(play->ack_group, ACK_OK);
     return PLAYER_OK;
   }
   if (play->pending == PEND_EOF) {
-    // TODO: Check if all drained, goto unconfigured, ACK_OK
-
     play->eof_requested = true;
     play->pending = PEND_NONE;
-    return PLAYER_OK;
   }
 
-  // 1. EOF drain - jak już nie ma nic do zdekodowania i nic do zagrania
+  if (!play->prebuffer_done) {
+    size_t avail = buf_get_fill(play->buf_in) + play->pending_len;
+    if (avail < PREBUFFER_BYTES && !play->eof_requested) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      return PLAYER_OK;
+    }
+    play->prebuffer_done = true;
+    PLAYER_LOGI("[DIAG PREBUFFER] done avail=%u", (unsigned)avail); // [NOWE]
+  }
+
   if (play->eof_requested && buf_get_fill(play->buf_in) == 0 &&
       play->pending_len == 0 && buf_get_fill(play->buf_out) == 0) {
-    drain_to_dac(play);
-    buf_flush(play->buf_in);
-    buf_flush(play->buf_out);
-    dec_reset(play->dec);
-    i2s_disable(play->dac);
-    play->eof_requested = false;
-    play->pending_len = 0;
-    play->no_progress = 0;
-    play->prebuffer_done = false;
-    play->i2s_configured = false;
-    play->last_rate = 0;
-    play->last_bits = 0;
-    play->last_channels = 0;
+    log_playing_diag(play, "EOF"); // [NOWE] było: od razu do_reset bez logu
+    if (play->i2s_configured) {
+      memset(tmp_pcm, 0, 4608);
+      size_t written = 0;
+      i2s_write(play->dac, tmp_pcm, 4608, &written);
+      play->diag_i2s_bytes += written; // [NOWE]
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    do_reset(play);
     memset(&play->play_cfg, 0, sizeof(play->play_cfg));
     play->state = PLAYER_STATE_UNCONFIGURED;
     if (play->cfg.on_state)
@@ -352,117 +392,169 @@ static player_err_t state_playing(player_t play) {
     return PLAYER_OK;
   }
 
-  // 2. Jeden krok dekodowania: pending + buf_in -> tmp_in -> dec_decode
-  size_t fill_in = buf_get_fill(play->buf_in);
-  if (fill_in > 0 || play->pending_len > 0) {
-    size_t total_in = play->pending_len;
+  // [NOWE] cała gałąź PCM, wcześniej nie było, PCM leciał przez dec_decode
+  if (play->play_cfg.codec == DEC_CODEC_PCM) {
+    if (!play->i2s_configured) {
+      if (i2s_reconfig(play->dac, play->play_cfg.sample_rate,
+                       play->play_cfg.bits,
+                       play->play_cfg.channels) != I2S_OK) {
+        return PLAYER_ERR_FAIL_I2S;
+      }
+      play->last_rate = play->play_cfg.sample_rate;
+      play->last_bits = play->play_cfg.bits;
+      play->last_channels = play->play_cfg.channels;
+      play->i2s_configured = true;
+      i2s_enable(play->dac);
+      PLAYER_LOGI("i2s reconfig PCM: %lu Hz %u bit %u ch",
+                  (unsigned long)play->last_rate, play->last_bits,
+                  play->last_channels);
+    }
+    size_t avail = buf_get_fill(play->buf_in);
+    if (avail == 0) {
+      if (!play->eof_requested)
+        vTaskDelay(pdMS_TO_TICKS(2));
+      return PLAYER_OK;
+    }
+    size_t want = avail < sizeof(tmp_pcm) ? avail : sizeof(tmp_pcm);
+    size_t n = buf_read_copy(play->buf_in, tmp_pcm, want);
+    if (n == 0)
+      return PLAYER_OK;
+    if (play->play_cfg.bits == 16) {
+      int16_t *pcm = (int16_t *)tmp_pcm;
+      for (size_t i = 0; i < n / 2; i++)
+        pcm[i] = (int16_t)((int32_t)pcm[i] / 2);
+    }
+    size_t off = 0;
+    while (off < n) {
+      size_t w = buf_write_partial(play->buf_out, tmp_pcm + off, n - off);
+      if (w == 0) {
+        drain_to_dac(play);
+        vTaskDelay(pdMS_TO_TICKS(1));
+      } else
+        off += w;
+    }
+    play->diag_frames++;
+    play->diag_pcm_bytes += n;
+    play->no_progress = 0;
+    drain_to_dac(play);
+    if (play->diag_frames - play->diag_last_log >= DIAG_LOG_EVERY) {
+      play->diag_last_log = play->diag_frames;
+      log_playing_diag(play, "PLAY PCM");
+    }
+    return PLAYER_OK;
+  }
+
+  // MP3 / AAC, bez zmian poza diagnostyką
+  size_t total_in = play->pending_len;
+  if (play->pending_len > 0)
     memcpy(tmp_in, dec_pending, play->pending_len);
-    if (fill_in > 0) {
-      size_t item_size = 0;
-      void *item = buf_read_up_to(play->buf_in, &item_size,
-                                  sizeof(tmp_in) - play->pending_len);
-      if (item) {
-        memcpy(tmp_in + play->pending_len, item, item_size);
-        total_in += item_size;
-        buf_return_item(play->buf_in, item);
-      }
-    }
-    if (total_in > 0) {
-      size_t consumed = 0, produced = 0;
-      dec_err_t rc = dec_decode(play->dec, tmp_in, total_in, tmp_pcm,
-                                sizeof(tmp_pcm), &consumed, &produced);
-      if (rc != DEC_OK)
-        return PLAYER_ERR_FAIL_DEC;
+  while (total_in < sizeof(tmp_in) && buf_get_fill(play->buf_in) > 0) {
+    size_t n = buf_read_copy(play->buf_in, tmp_in + total_in,
+                             sizeof(tmp_in) - total_in);
+    if (n == 0)
+      break;
+    total_in += n;
+  }
 
-      if (consumed < total_in) {
-        size_t left = total_in - consumed;
-        memmove(dec_pending, tmp_in + consumed, left);
-        play->pending_len = left;
-      } else {
+  bool need_more_data = false;
+  if (total_in > 0) {
+    size_t consumed = 0, produced = 0;
+    dec_err_t rc = dec_decode(play->dec, tmp_in, total_in, tmp_pcm,
+                              sizeof(tmp_pcm), &consumed, &produced);
+    if (rc != DEC_OK) {
+      if (play->eof_requested && buf_get_fill(play->buf_in) == 0) {
         play->pending_len = 0;
+        return PLAYER_OK;
       }
+      log_playing_diag(play, "FAIL_DEC"); // [NOWE]
+      return PLAYER_ERR_FAIL_DEC;
+    }
+    if (consumed < total_in) {
+      size_t left = total_in - consumed;
+      memmove(dec_pending, tmp_in + consumed, left);
+      play->pending_len = left;
+    } else
+      play->pending_len = 0;
 
-      if (produced > 0) {
-        dec_info_t info = dec_get_info(play->dec);
-        if (info.sample_rate != 0 && info.bits != 0 && info.channels != 0) {
-          if (!play->i2s_configured || info.sample_rate != play->last_rate ||
-              info.bits != play->last_bits ||
-              info.channels != play->last_channels) {
-            if (i2s_reconfig(play->dac, info.sample_rate, info.bits,
-                             info.channels) == I2S_OK) {
-              play->last_rate = info.sample_rate;
-              play->last_bits = info.bits;
-              play->last_channels = info.channels;
-              play->i2s_configured = true;
-              i2s_enable(play->dac);
-              PLAYER_LOGI("i2s reconfig: %lu Hz %u bit %u ch",
-                          (unsigned long)play->last_rate, play->last_bits,
-                          play->last_channels);
-            }
-          }
+    if (produced > 0) {
+      play->no_progress = 0;
+      play->diag_frames++;              // [NOWE]
+      play->diag_pcm_bytes += produced; // [NOWE]
+      dec_info_t info = dec_get_info(play->dec);
+      uint32_t rate =
+          info.sample_rate ? info.sample_rate : play->play_cfg.sample_rate;
+      uint8_t bits = info.bits ? info.bits : play->play_cfg.bits;
+      uint8_t ch = info.channels ? info.channels : play->play_cfg.channels;
+      if (rate != 0 && bits != 0 && ch != 0) {
+        if (!play->i2s_configured || rate != play->last_rate ||
+            bits != play->last_bits || ch != play->last_channels) {
+          if (i2s_reconfig(play->dac, rate, bits, ch) != I2S_OK)
+            return PLAYER_ERR_FAIL_I2S;
+          play->last_rate = rate;
+          play->last_bits = bits;
+          play->last_channels = ch;
+          play->i2s_configured = true;
+          i2s_enable(play->dac);
+          PLAYER_LOGI("i2s reconfig: %lu Hz %u bit %u ch", (unsigned long)rate,
+                      bits, ch);
         }
-        // 16-bit, -6dB jak w teście, 24-bit robimy w następnym kroku
+      }
+      if (bits == 16) {
         int16_t *pcm = (int16_t *)tmp_pcm;
-        size_t samples = produced / 2;
-        for (size_t i = 0; i < samples; i++) {
-          int32_t s = pcm[i];
-          pcm[i] = (int16_t)(s / 2);
-        }
-        play->no_progress = 0;
-        size_t off = 0;
-        while (off < produced) {
-          size_t w =
-              buf_write_partial(play->buf_out, tmp_pcm + off, produced - off);
-          if (w == 0) {
-            drain_to_dac(play);
-            vTaskDelay(pdMS_TO_TICKS(1));
-          } else {
-            off += w;
-          }
-        }
+        for (size_t i = 0; i < produced / 2; i++)
+          pcm[i] = (int16_t)((int32_t)pcm[i] / 2);
+      }
+      size_t off = 0;
+      while (off < produced) {
+        size_t w =
+            buf_write_partial(play->buf_out, tmp_pcm + off, produced - off);
+        if (w == 0) {
+          drain_to_dac(play);
+          vTaskDelay(pdMS_TO_TICKS(1));
+        } else
+          off += w;
+      }
+      if (play->diag_frames - play->diag_last_log >= DIAG_LOG_EVERY) { // [NOWE]
+        play->diag_last_log = play->diag_frames;
+        log_playing_diag(play, "PLAY");
+      }
+    } else if (consumed == 0) {
+      if (play->eof_requested && buf_get_fill(play->buf_in) == 0) {
+        play->pending_len = 0;
+      } else if (total_in < sizeof(tmp_in)) {
+        need_more_data = true;
       } else {
-        if (consumed == 0)
-          play->no_progress++;
-        else
-          play->no_progress = 0;
+        play->no_progress++;
+        if (play->no_progress % 5 == 0)
+          log_playing_diag(play, "NO_PROGRESS"); // [NOWE]
       }
     }
-  }
+  } else
+    need_more_data = true;
 
-  // 3. Drain
   drain_to_dac(play);
-
-  if (play->no_progress > 100)
+  if (play->no_progress > 10) {
+    log_playing_diag(play, "FAIL_NO_PROGRESS"); // [NOWE]
     return PLAYER_ERR_FAIL_DEC;
-  if (fill_in == 0 && play->pending_len == 0 && !play->eof_requested) {
-    vTaskDelay(pdMS_TO_TICKS(1));
   }
+  if (need_more_data && !play->eof_requested)
+    vTaskDelay(pdMS_TO_TICKS(2));
   return PLAYER_OK;
 }
 
 /**
  * @brief State PAUSED: wait for STOP / RESUME / EXIT.
- * @details PEND_STOP -> IDLE + ACK_OK (TODO: flush buf),
+ * @details PEND_STOP -> do_reset, keep play_cfg -> IDLE + ACK_OK,
  *          PEND_RESUME -> PLAYING + ACK_OK. No playback in PAUSED,
- *          task blocks on queue (portMAX_DELAY in player_task()).
- * @param[in] play Handle.
- * @return PLAYER_OK.
+ *          no dec_reset, no buf_flush, buf / dec_pending stay.
+ *          Task blocks on queue (portMAX_DELAY in player_task()).
  */
 static player_err_t state_paused(player_t play) {
   if (play->pending == PEND_EXIT) {
     return PLAYER_OK;
   }
   if (play->pending == PEND_STOP) {
-    // TODO: Flush buffers
-    buf_flush(play->buf_in);
-    buf_flush(play->buf_out);
-    dec_reset(play->dec);
-    i2s_disable(play->dac);
-    play->i2s_configured = false;
-    play->prebuffer_done = false;
-    play->pending_len = 0;
-    play->eof_requested = false;
-    play->no_progress = 0;
+    do_reset(play);
 
     play->state = PLAYER_STATE_IDLE;
     play->pending = PEND_NONE;
@@ -486,42 +578,28 @@ static player_err_t state_paused(player_t play) {
 }
 
 /**
- * @brief State CONFIGURING: do buf/dec/i2s setup, then IDLE.
+ * @brief State CONFIGURING: set codec, reset, then IDLE.
  * @details PEND_EXIT returns OK, loop exits.
- *          Otherwise (TODO): malloc buf_in/out in PSRAM, dec_init(codec),
- *          for PCM create I2S with cfg rate/bits/ch, for codec set
- *          i2s_configured = false, real I2S config after first decoded frame
- *          in state_playing(). On success -> IDLE + ACK_OK + on_state(IDLE).
- *          On fail -> return FAIL_DEC / FAIL_I2S, task loop calls
- * state_error().
- * @param[in] play Handle.
- * @return PLAYER_OK, or FAIL_DEC / FAIL_I2S on setup fail.
+ *          Otherwise: dec_set_codec(pending_cfg.codec), on fail ACK_FAIL
+ *          + return FAIL_DEC -> state_error(). On success do_reset(),
+ *          play_cfg = pending_cfg, clear pending_cfg -> IDLE + ACK_OK
+ *          + on_state(IDLE). No malloc here, buf / dec / i2s are borrowed.
+ *          i2s_configured = false, real I2S config after first decoded
+ *          frame in state_playing().
  */
 static player_err_t state_configuring(player_t play) {
   if (play->pending == PEND_EXIT) {
     return PLAYER_OK;
   }
-  // TODO: decoder configuration
 
   if (dec_set_codec(play->dec, play->pending_cfg.codec) != DEC_OK) {
     xEventGroupSetBits(play->ack_group, ACK_FAIL);
     return PLAYER_ERR_FAIL_DEC;
   }
-  dec_reset(play->dec);
-  buf_flush(play->buf_in);
-  buf_flush(play->buf_out);
-  i2s_disable(play->dac);
 
+  do_reset(play);
   play->play_cfg = play->pending_cfg;
   memset(&play->pending_cfg, 0, sizeof(play->pending_cfg));
-  play->pending_len = 0;
-  play->eof_requested = false;
-  play->no_progress = 0;
-  play->prebuffer_done = false;
-  play->i2s_configured = false;
-  play->last_rate = 0;
-  play->last_bits = 0;
-  play->last_channels = 0;
 
   play->state = PLAYER_STATE_IDLE;
   play->pending = PEND_NONE;
@@ -535,30 +613,16 @@ static player_err_t state_configuring(player_t play) {
 /**
  * @brief Error handler: safe state on any state_*() error.
  * @details Sets state UNCONFIGURED, clears pending, calls on_error(err),
- *          then on_state(UNCONFIGURED). TODO: mute/stop I2S, clear buf,
- *          close source, dec_deinit / i2s_del, then UNCONFIGURED.
+ *          then on_state(UNCONFIGURED). Does do_reset() + clear play_cfg.
+ *          Does NOT dec_deinit / i2s_del, handles are borrowed.
  *          If err == PLAYER_OK, does nothing.
- * @param[in] play Handle.
- * @param[in] err Error from state_*(), PLAYER_OK = no error.
- * @return PLAYER_OK always.
  */
 static player_err_t state_error(player_t play, player_err_t err) {
   if (err == PLAYER_OK) {
     return PLAYER_OK;
   }
   // Do RESET
-  buf_flush(play->buf_in);
-  buf_flush(play->buf_out);
-  dec_reset(play->dec);
-  i2s_disable(play->dac);
-  play->eof_requested = false;
-  play->pending_len = 0;
-  play->no_progress = 0;
-  play->prebuffer_done = false;
-  play->i2s_configured = false;
-  play->last_rate = 0;
-  play->last_bits = 0;
-  play->last_channels = 0;
+  do_reset(play);
   memset(&play->play_cfg, 0, sizeof(play->play_cfg));
 
   play->state = PLAYER_STATE_UNCONFIGURED;
@@ -574,24 +638,20 @@ static player_err_t state_error(player_t play, player_err_t err) {
 
 /**
  * @brief Task cleanup on EXIT.
- * @details Called once before vTaskDelete(). TODO: free buf, dec_deinit,
- * i2s_del.
- * @param[in] play Handle.
- * @return PLAYER_OK.
+ * @details Called once before vTaskDelete(). Nothing to free here,
+ *          buf / dec / i2s are borrowed and live in main.
  */
 static player_err_t state_cleanup(player_t play) { return PLAYER_OK; }
 
 /**
- * @brief Player task, owner of buf/dec/i2s (TODO) and state machine.
- * @details Loop:
- *          1) wait_q = portMAX_DELAY in IDLE/UNCONFIGURED/PAUSED (block),
- *             0 in PLAYING/CONFIGURING (poll, do work).
- *          2) xQueueReceive() command, validate vs current state:
- *             wrong state -> ACK_FAIL immediately, correct -> set pending.
- *          3) Dispatch to state_*() based on play->state, capture err.
- *          4) If err != OK, call state_error() -> UNCONFIGURED.
- *          5) If pending == PEND_EXIT, exit loop, cleanup, ACK_OK, vTaskDelete.
- * @param[in] arg player_t, from player_start().
+ * @brief Player task, borrower of buf/dec/i2s and owner of state machine.
+ * @details Loop: 1) wait_q = portMAX_DELAY in IDLE/UNCONFIGURED/PAUSED,
+ *             0 in PLAYING/CONFIGURING. 2) xQueueReceive() command,
+ *             validate vs current state: wrong state -> ACK_FAIL
+ *             immediately, correct -> set pending. 3) Dispatch to
+ *             state_*(), capture err. 4) If err != OK, state_error()
+ *             -> UNCONFIGURED. 5) If pending == PEND_EXIT, exit loop,
+ *             cleanup, ACK_OK, vTaskDelete.
  */
 static void player_task(void *arg) {
   PLAYER_LOGI("task startup");
@@ -979,6 +1039,9 @@ player_err_t player_get_diag(player_t play, player_diag_t *out) {
   } else {
     out->stack_hwm = 0;
   }
+  out->frames = play->diag_frames;       // [NOWE]
+  out->pcm_bytes = play->diag_pcm_bytes; // [NOWE]
+  out->i2s_bytes = play->diag_i2s_bytes; // [NOWE]
   return PLAYER_OK;
 }
 

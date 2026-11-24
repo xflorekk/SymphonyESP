@@ -13,4 +13,6 @@ idf_component_register(
                         esp_ringbuf
                     EMBED_FILES 
                         "test_5s.mp3"
+                        "test_5s.aac"
+                        "test_5s.pcm"
                     )

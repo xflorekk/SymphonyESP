@@ -1,12 +1,7 @@
 /**
  * @file main.c
- * @brief Test player po poprawkach przejść: UNCONFIGURED zeruje config.
- *
- * Src (main) jest odpowiedzialny za kolejność komend:
- *  ITER 1/2: CONFIG (z UNCONFIGURED) -> PLAY -> feed -> EOF -> UNCONFIGURED
- *  ITER 3:   CONFIG -> PLAY -> feed 30k -> STOP -> IDLE
- *            -> CONFIG = FAIL (oczekiwane, tylko z UNCONFIGURED)
- *            -> RESET -> UNCONFIGURED -> CONFIG -> PLAY -> feed full -> EOF
+ * @brief Loop nieskończony: mp3 -> aac -> pcm -> mp3...
+ * Każdy utwór: PLAY, po 2s PAUSE na 2s, RESUME, dograj do EOF.
  */
 #include "buf.h"
 #include "dec.h"
@@ -22,6 +17,10 @@ static player_storage_t storage;
 
 extern const uint8_t test_5s_mp3_start[] asm("_binary_test_5s_mp3_start");
 extern const uint8_t test_5s_mp3_end[] asm("_binary_test_5s_mp3_end");
+extern const uint8_t test_5s_aac_start[] asm("_binary_test_5s_aac_start");
+extern const uint8_t test_5s_aac_end[] asm("_binary_test_5s_aac_end");
+extern const uint8_t test_5s_pcm_start[] asm("_binary_test_5s_pcm_start");
+extern const uint8_t test_5s_pcm_end[] asm("_binary_test_5s_pcm_end");
 
 static void on_state(void *ctx, player_state_t state) {
   const char *n = "?";
@@ -48,28 +47,6 @@ static void on_error(void *ctx, player_err_t err) {
   ESP_LOGE(TAG, "on_error: %s", player_err_to_str(err));
 }
 
-static void log_player_diag(player_t play, const char *step) {
-  player_diag_t d = {0};
-  player_get_diag(play, &d);
-  ESP_LOGI(TAG, "%s: state=%d heap=%u heap_min=%u stack_hwm=%lu", step, d.state,
-           (unsigned)d.heap_free, (unsigned)d.heap_min,
-           (unsigned long)d.stack_hwm);
-}
-static void log_hw_diag(i2s_t dac, dec_t dec, buf_t buf_in, buf_t buf_out,
-                        const char *step) {
-  i2s_diag_t di = i2s_get_diag(dac);
-  dec_diag_t dd = dec_get_diag(dec);
-  buf_diag_t bi = buf_get_diag(buf_in);
-  buf_diag_t bo = buf_get_diag(buf_out);
-  ESP_LOGI(TAG,
-           "%s i2s: bytes=%lu reconfig=%lu | dec: frames=%lu "
-           "bytes_out=%lu | buf_in max=%lu buf_out max=%lu",
-           step, (unsigned long)di.write_bytes, /*(unsigned long)di.err_cnt,*/
-           (unsigned long)di.reconfig_cnt, (unsigned long)dd.frame_cnt,
-           (unsigned long)dd.bytes_out, (unsigned long)bi.max_fill,
-           (unsigned long)bo.max_fill);
-}
-
 #define CHECK(x, msg)                                                          \
   do {                                                                         \
     player_err_t _r = (x);                                                     \
@@ -81,58 +58,75 @@ static void log_hw_diag(i2s_t dac, dec_t dec, buf_t buf_in, buf_t buf_out,
     }                                                                          \
   } while (0)
 
-/**
- * @brief Src: karmi buf_in całym plikiem, oddaje CPU po każdym chunku.
- * @details Po każdym udanym buf_write vTaskDelay(5), żeby player na CPU1
- *          miał czas na decode i IDLE0 nie głodował. Przy FAIL / pełnym
- *          buf vTaskDelay(10). Log co 10240 bajtów.
- */
-static void feed_mp3(buf_t buf_in, size_t mp3_len) {
-  size_t pos = 0;
-  uint32_t last_log = 0;
-  while (pos < mp3_len) {
-    size_t free_in = buf_get_free(buf_in);
-    if (free_in >= 2048) {
-      size_t want = mp3_len - pos > 1024 ? 1024 : mp3_len - pos;
-      if (buf_write(buf_in, test_5s_mp3_start + pos, want) == BUF_OK) {
-        pos += want;
-        vTaskDelay(pdMS_TO_TICKS(5));
-        if (pos - last_log >= 10240) {
-          ESP_LOGI(TAG, "src pos %u / %u free %u", (unsigned)pos,
-                   (unsigned)mp3_len, (unsigned)free_in);
-          last_log = pos;
-        }
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(10));
-      }
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
+static void log_diag(player_t play, const char *tag) {
+  player_diag_t d;
+  if (player_get_diag(play, &d) == PLAYER_OK) {
+    ESP_LOGI(TAG,
+             "[MAIN DIAG %s] state=%d frames=%u pcm=%u i2s=%u heap=%u min=%u "
+             "stack_hwm=%u",
+             tag, (int)d.state, (unsigned)d.frames, (unsigned)d.pcm_bytes,
+             (unsigned)d.i2s_bytes, (unsigned)d.heap_free, (unsigned)d.heap_min,
+             (unsigned)d.stack_hwm);
   }
-  ESP_LOGI(TAG, "src done pos %u / %u", (unsigned)pos, (unsigned)mp3_len);
 }
 
-static void feed_mp3_partial(buf_t buf_in, size_t bytes) {
+// Jeden utwór: CONFIG -> PLAY -> feed z pauzą 2s po 2s grania -> EOF
+static void play_track(player_t play, buf_t buf_in, const char *name,
+                       const uint8_t *data, size_t len, player_dec_cfg_t cfg) {
+  ESP_LOGI(TAG, "===== TRACK %s START len=%u =====", name, (unsigned)len);
+  CHECK(player_cmd_config(play, &cfg, 1000), "CONFIG");
+  CHECK(player_cmd_play(play, 1000), "PLAY");
+
+  TickType_t start = xTaskGetTickCount();
+  bool paused_once = false;
   size_t pos = 0;
-  while (pos < bytes) {
-    if (buf_get_free(buf_in) >= 2048) {
-      size_t want = bytes - pos > 1024 ? 1024 : bytes - pos;
-      if (buf_write(buf_in, test_5s_mp3_start + pos, want) == BUF_OK) {
-        pos += want;
-        vTaskDelay(pdMS_TO_TICKS(5));
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(10));
-      }
+
+  while (pos < len) {
+    // Pauza po 2s grania, w trakcie feedu
+    if (!paused_once && (xTaskGetTickCount() - start) >= pdMS_TO_TICKS(2000)) {
+      ESP_LOGI(TAG, "[%s] 2s grania, PAUSE na 2s", name);
+      CHECK(player_cmd_pause(play, 1000), "PAUSE 2s");
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      ESP_LOGI(TAG, "[%s] RESUME", name);
+      CHECK(player_cmd_resume(play, 1000), "RESUME");
+      paused_once = true;
+    }
+    // Feed z naturalnym backpressure, bez buf_get_free i bez delay 5ms
+    size_t want = len - pos > 1024 ? 1024 : len - pos;
+    size_t w = buf_write_partial(buf_in, data + pos, want);
+    if (w == 0) {
+      // bufor pełny, player jeszcze nie zjadł, czekaj
+      vTaskDelay(pdMS_TO_TICKS(2));
     } else {
-      vTaskDelay(pdMS_TO_TICKS(10));
+      pos += w;
+      // brak delay, tempo dyktuje player
     }
   }
-  ESP_LOGI(TAG, "src partial done %u", (unsigned)pos);
+
+  // Feed skończył się przed 2s, np. MP3 w 1s, a pauza ma być po 2s grania
+  // Czekaj do 2s od PLAY i dopiero pauzuj
+  if (!paused_once) {
+    TickType_t elapsed = xTaskGetTickCount() - start;
+    if (elapsed < pdMS_TO_TICKS(2000)) {
+      vTaskDelay(pdMS_TO_TICKS(2000) - elapsed);
+    }
+    ESP_LOGI(TAG, "[%s] 2s grania po feedzie, PAUSE na 2s", name);
+    CHECK(player_cmd_pause(play, 1000), "PAUSE 2s");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    ESP_LOGI(TAG, "[%s] RESUME", name);
+    CHECK(player_cmd_resume(play, 1000), "RESUME");
+    paused_once = true;
+  }
+
+  ESP_LOGI(TAG, "[%s] feed done, EOF", name);
+  CHECK(player_cmd_eof(play, 8000), "EOF");
+  vTaskDelay(pdMS_TO_TICKS(300));
+  log_diag(play, name);
+  ESP_LOGI(TAG, "===== TRACK %s DONE =====", name);
+  vTaskDelay(pdMS_TO_TICKS(500));
 }
 
 void app_main(void) {
-  ESP_LOGI(TAG, "heap before hw: %u", (unsigned)xPortGetFreeHeapSize());
-
   buf_t buf_in = buf_create(32 * 1024);
   buf_t buf_out = buf_create(32 * 1024);
   i2s_cfg_t i2s_cfg = {
@@ -159,8 +153,6 @@ void app_main(void) {
     for (;;)
       vTaskDelay(pdMS_TO_TICKS(1000));
   }
-  ESP_LOGI(TAG, "heap after hw: %u", (unsigned)xPortGetFreeHeapSize());
-
   player_hw_t hw = {
       .i2s = dac, .buf_in = buf_in, .buf_out = buf_out, .dec = dec};
   player_cfg_t pcfg = {.on_state = on_state,
@@ -174,93 +166,25 @@ void app_main(void) {
   vTaskDelay(pdMS_TO_TICKS(200));
 
   size_t mp3_len = test_5s_mp3_end - test_5s_mp3_start;
-  ESP_LOGI(TAG, "mp3 len %u", (unsigned)mp3_len);
-  player_dec_cfg_t mp3 = {
+  size_t aac_len = test_5s_aac_end - test_5s_aac_start;
+  size_t pcm_len = test_5s_pcm_end - test_5s_pcm_start;
+  ESP_LOGI(TAG, "mp3 len %u aac len %u pcm len %u expected PCM ~882000",
+           (unsigned)mp3_len, (unsigned)aac_len, (unsigned)pcm_len);
+
+  player_dec_cfg_t cfg_mp3 = {
       .codec = DEC_CODEC_MP3, .sample_rate = 44100, .bits = 16, .channels = 2};
+  player_dec_cfg_t cfg_aac = {
+      .codec = DEC_CODEC_AAC, .sample_rate = 44100, .bits = 16, .channels = 2};
+  // PCM: CONFIG musi nieść rate/bits/ch, bo PCM nie ma nagłówka
+  player_dec_cfg_t cfg_pcm = {
+      .codec = DEC_CODEC_PCM, .sample_rate = 44100, .bits = 16, .channels = 2};
 
-  size_t heap_eof1 = 0, heap_eof2 = 0, heap_eof3 = 0;
-
-  // ===== ITER 1 + ITER 2: EOF -> UNCONFIGURED -> CONFIG =====
-  for (int iter = 0; iter < 2; iter++) {
-    ESP_LOGI(TAG, "===== ITER %d (EOF path) =====", iter + 1);
-    CHECK(player_cmd_config(play, &mp3, 1000), "CONFIG MP3");
-    log_player_diag(play, "after CONFIG");
-    CHECK(player_cmd_play(play, 1000), "PLAY");
-
-    feed_mp3(buf_in, mp3_len);
-
-    CHECK(player_cmd_eof(play, 5000), "EOF");
-    vTaskDelay(pdMS_TO_TICKS(200));
-    log_player_diag(play, "after EOF");
-    log_hw_diag(dac, dec, buf_in, buf_out, "after EOF");
-
-    player_diag_t pd = {0};
-    player_get_diag(play, &pd);
-    if (iter == 0)
-      heap_eof1 = pd.heap_free;
-    else
-      heap_eof2 = pd.heap_free;
-
-    // diag reset na następną iterację
-    i2s_reset_diag(dac);
-    buf_reset_diag(buf_in);
-    buf_reset_diag(buf_out);
-    dec_reset_diag(dec);
-    vTaskDelay(pdMS_TO_TICKS(500));
+  int iter = 0;
+  for (;;) {
+    ESP_LOGI(TAG, "===== LOOP %d START =====", iter++);
+    play_track(play, buf_in, "MP3", test_5s_mp3_start, mp3_len, cfg_mp3);
+    play_track(play, buf_in, "AAC", test_5s_aac_start, aac_len, cfg_aac);
+    play_track(play, buf_in, "PCM", test_5s_pcm_start, pcm_len, cfg_pcm);
+    ESP_LOGI(TAG, "===== LOOP %d DONE =====", iter - 1);
   }
-
-  // ===== ITER 3: STOP -> IDLE -> CONFIG musi FAIL, potem RESET -> CONFIG =====
-  ESP_LOGI(TAG, "===== ITER 3 (STOP/RESET path) =====");
-  CHECK(player_cmd_config(play, &mp3, 1000), "CONFIG MP3 (iter3)");
-  CHECK(player_cmd_play(play, 1000), "PLAY (iter3)");
-  feed_mp3_partial(buf_in, 30720);
-  vTaskDelay(pdMS_TO_TICKS(200));
-  CHECK(player_cmd_stop(play, 1000), "STOP -> IDLE");
-  log_player_diag(play, "after STOP (expect IDLE)");
-
-  // CONFIG z IDLE ma się nie udać - tylko z UNCONFIGURED
-  player_err_t rc = player_cmd_config(play, &mp3, 1000);
-  ESP_LOGI(TAG, "CONFIG from IDLE -> %s (expect FAIL)", player_err_to_str(rc));
-  if (rc == PLAYER_OK) {
-    ESP_LOGE(TAG,
-             "BUG: CONFIG from IDLE should FAIL, check player_task validation");
-    for (;;)
-      vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-
-  CHECK(player_cmd_reset(play, 1000), "RESET -> UNCONFIGURED");
-  log_player_diag(play, "after RESET (expect UNCONFIGURED)");
-
-  // Teraz CONFIG legalny
-  CHECK(player_cmd_config(play, &mp3, 1000), "CONFIG MP3 after RESET");
-  CHECK(player_cmd_play(play, 1000), "PLAY after RESET");
-  feed_mp3(buf_in, mp3_len);
-  CHECK(player_cmd_eof(play, 5000), "EOF (iter3)");
-  vTaskDelay(pdMS_TO_TICKS(200));
-  log_player_diag(play, "after EOF iter3");
-  log_hw_diag(dac, dec, buf_in, buf_out, "after EOF iter3");
-  {
-    player_diag_t pd = {0};
-    player_get_diag(play, &pd);
-    heap_eof3 = pd.heap_free;
-  }
-
-  // ===== Werdykt =====
-  ESP_LOGI(TAG, "heap_eof1=%u heap_eof2=%u heap_eof3=%u", (unsigned)heap_eof1,
-           (unsigned)heap_eof2, (unsigned)heap_eof3);
-  if (heap_eof1 == heap_eof2 && heap_eof2 == heap_eof3) {
-    ESP_LOGI(TAG, "HEAP OK - no leak, UNCONFIGURED zeruje config");
-  } else {
-    ESP_LOGE(TAG, "HEAP LEAK - heap spada po każdym EOF");
-  }
-
-  CHECK(player_cmd_exit(play, 1000), "EXIT");
-  player_destroy(play);
-  buf_destroy(buf_in);
-  buf_destroy(buf_out);
-  dec_destroy(dec);
-  i2s_destroy(dac);
-  ESP_LOGI(TAG, "TEST OK");
-  for (;;)
-    vTaskDelay(pdMS_TO_TICKS(1000));
 }

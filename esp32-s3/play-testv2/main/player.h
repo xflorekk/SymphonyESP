@@ -128,6 +128,9 @@ typedef struct {
   size_t heap_min;
   uint32_t stack_hwm;
   player_state_t state;
+  uint32_t frames;
+  uint32_t pcm_bytes;
+  uint32_t i2s_bytes;
 } player_diag_t;
 
 /**
