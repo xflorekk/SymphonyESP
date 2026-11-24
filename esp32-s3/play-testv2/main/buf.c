@@ -82,22 +82,44 @@ size_t buf_write_partial(buf_t buf, const uint8_t *data, size_t len) {
   if (!buf || !data || len == 0) {
     return 0;
   }
-  size_t free = buf_get_free(buf);
-  if (free == 0) {
-    buf->diag.overrun_cnt++;
-    return 0;
+
+  size_t written = 0;
+  // max item dla ringbuffera, w ESP-IDF to xRingbufferGetMaxItemSize
+  // jak go nie masz, to użyj buf->capacity - 8
+  size_t max_item = xRingbufferGetMaxItemSize(buf->handle);
+  if (max_item == 0) {
+    max_item = len;
   }
-  size_t to_write = len < free ? len : free;
-  if (xRingbufferSend(buf->handle, data, to_write, 0) != pdTRUE) {
-    buf->diag.overrun_cnt++;
-    return 0;
+  // małe chunki zwiększają szansę że zmieści się w ciągłym wolnym
+  // 1024 jest bezpieczne dla NoSplit i dla AllowSplit
+  if (max_item > 1024) {
+    max_item = 1024;
   }
-  buf->diag.written += to_write;
-  size_t fill = buf_get_fill(buf);
-  if (fill > buf->diag.max_fill) {
-    buf->diag.max_fill = fill;
+
+  while (written < len) {
+    size_t chunk = len - written;
+    if (chunk > max_item) {
+      chunk = max_item;
+    }
+    if (xRingbufferSend(buf->handle, data + written, chunk, 0) != pdTRUE) {
+      break; // brak ciągłego miejsca, zwróć ile się udało, nie 0 jako błąd
+             // całości
+    }
+    written += chunk;
   }
-  return to_write;
+
+  if (written > 0) {
+    buf->diag.written += written;
+    size_t fill = buf_get_fill(buf);
+    if (fill > buf->diag.max_fill) {
+      buf->diag.max_fill = fill;
+    }
+  }
+  // UWAGA: nie rób overrun_cnt++ jak written == 0
+  // to jest backpressure, nie overrun, producent spróbuje znowu
+  // overrun licz tylko tam gdzie naprawdę dropujesz dane i nie próbujesz znowu
+
+  return written;
 }
 
 bool buf_over_thr(buf_t buf, size_t thr) {
