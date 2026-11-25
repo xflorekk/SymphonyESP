@@ -72,7 +72,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi->cfg.on_event(wifi->cfg.user_ctx, WIFI_EVT_CONNECTING, &data);
       }
 
-      WIFI_LOGI(, "sta start, connecting to %s", wifi->cfg.ssid);
+      WIFI_LOGI("sta start, connecting to %s", wifi->cfg.ssid);
       break;
     }
 
@@ -84,7 +84,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
       if (wifi->cfg.on_event) {
         wifi->cfg.on_event(wifi->cfg.user_ctx, WIFI_EVT_CONNECTED, &data);
       }
-      WIFI_LOGI(, "sta connected");
+      WIFI_LOGI("sta connected");
       break;
 
     case WIFI_EVENT_STA_DISCONNECTED: {
@@ -96,6 +96,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
       wifi_evt_data_t data = {.reason = e ? e->reason : 0};
       if (wifi->cfg.on_event) {
         wifi->cfg.on_event(wifi->cfg.user_ctx, WIFI_EVT_DISCONNECTED, &data);
+      }
+      if (!wifi->started) {
+        wifi->state = WIFI_STATE_IDLE;
+        break;
       }
       WIFI_LOGW("sta disconnected, retry %u/%u", wifi->retry,
                 wifi->cfg.max_retry);
@@ -158,15 +162,36 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 static esp_err_t wifi_apply_config(wifi_t wifi) {
-  wifi_config_t wifi_config = {0};
   size_t ssid_len = strnlen(wifi->cfg.ssid, sizeof(wifi->cfg.ssid));
   size_t pass_len = strnlen(wifi->cfg.password, sizeof(wifi->cfg.password));
+  if (ssid_len == 0 || ssid_len > 32 || pass_len > 64) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  wifi_config_t wifi_config = {0};
   memcpy(wifi_config.sta.ssid, wifi->cfg.ssid, ssid_len);
   memcpy(wifi_config.sta.password, wifi->cfg.password, pass_len);
   wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
   wifi_config.sta.pmf_cfg.capable = true;
   wifi_config.sta.pmf_cfg.required = false;
   return esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+}
+static void wifi_cleanup_initialized(wifi_t wifi) {
+  if (wifi->wifi_handler) {
+    esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                          wifi->wifi_handler);
+    wifi->wifi_handler = NULL;
+  }
+  if (wifi->ip_handler) {
+    esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID,
+                                          wifi->ip_handler);
+    wifi->ip_handler = NULL;
+  }
+  esp_wifi_deinit();
+  if (wifi->netif) {
+    esp_netif_destroy(wifi->netif);
+    wifi->netif = NULL;
+  }
+  wifi->initialized = false;
 }
 
 wifi_err_t wifi_init(wifi_handle_storage_t *storage, const wifi_cfg_t *cfg,
@@ -175,6 +200,18 @@ wifi_err_t wifi_init(wifi_handle_storage_t *storage, const wifi_cfg_t *cfg,
     return WIFI_ERR_INVALID_ARG;
   }
   if (cfg->ssid[0] == '\0') {
+    return WIFI_ERR_INVALID_ARG;
+  }
+
+  size_t ssid_len = strnlen(cfg->ssid, sizeof(cfg->ssid));
+  size_t pass_len = strnlen(cfg->password, sizeof(cfg->password));
+  if (ssid_len == 0 || ssid_len > 32 || pass_len > 64) {
+    return WIFI_ERR_INVALID_ARG;
+  }
+  if (cfg->mode != WIFI_MODE_STA) {
+    return WIFI_ERR_INVALID_ARG;
+  }
+  if (cfg->ps > WIFI_PS_MAX_MODEM) {
     return WIFI_ERR_INVALID_ARG;
   }
 
@@ -197,7 +234,12 @@ wifi_err_t wifi_destroy(wifi_t wifi) {
   if (!wifi) {
     return WIFI_ERR_INVALID_ARG;
   }
-  wifi_stop(wifi);
+  if (wifi->started) {
+    wifi_stop(wifi);
+  }
+  if (wifi->initialized) {
+    wifi_cleanup_initialized(wifi);
+  }
   memset(wifi, 0, sizeof(struct wifi_s));
   return WIFI_OK;
 }
@@ -226,16 +268,19 @@ wifi_err_t wifi_start(wifi_t wifi) {
     }
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     if (esp_wifi_init(&init_cfg) != ESP_OK) {
+      wifi_cleanup_initialized(wifi);
       return WIFI_ERR_FAIL;
     }
     if (esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                             &wifi_event_handler, wifi,
                                             &wifi->wifi_handler) != ESP_OK) {
+      wifi_cleanup_initialized(wifi);
       return WIFI_ERR_FAIL;
     }
     if (esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID,
                                             &wifi_event_handler, wifi,
                                             &wifi->ip_handler) != ESP_OK) {
+      wifi_cleanup_initialized(wifi);
       return WIFI_ERR_FAIL;
     }
     wifi->initialized = true;
@@ -267,13 +312,18 @@ wifi_err_t wifi_stop(wifi_t wifi) {
     wifi->state = WIFI_STATE_IDLE;
     return WIFI_OK;
   }
-  esp_wifi_stop();
+  // WAZNE: przed esp_wifi_stop, zeby handler DISCONNECTED widzial stop
   wifi->started = false;
   wifi->state = WIFI_STATE_IDLE;
+  wifi->retry = 0;
   memset(wifi->ip_str, 0, sizeof(wifi->ip_str));
+
+  esp_err_t err = esp_wifi_stop();
+  if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
+    return WIFI_ERR_FAIL;
+  }
   return WIFI_OK;
 }
-
 wifi_err_t wifi_connect(wifi_t wifi) {
   if (!wifi) {
     return WIFI_ERR_INVALID_ARG;
@@ -307,7 +357,9 @@ wifi_err_t wifi_set_credentials(wifi_t wifi, const char *ssid,
   if (!wifi || !ssid || !password) {
     return WIFI_ERR_INVALID_ARG;
   }
-  if (ssid[0] == '\0') {
+  size_t ssid_len = strnlen(ssid, 64);
+  size_t pass_len = strnlen(password, 64);
+  if (ssid_len == 0 || ssid_len > 32 || pass_len > 64) {
     return WIFI_ERR_INVALID_ARG;
   }
   strncpy(wifi->cfg.ssid, ssid, sizeof(wifi->cfg.ssid) - 1);
@@ -332,8 +384,16 @@ wifi_err_t wifi_set_mode(wifi_t wifi, wifi_mode_t mode) {
   if (!wifi) {
     return WIFI_ERR_INVALID_ARG;
   }
-  // For now STA only. AP / APSTA is before commercialization step.
-  // Keep function for API completeness, but do not switch in test.
+  if (mode != WIFI_MODE_STA) {
+    return WIFI_ERR_INVALID_ARG;
+  }
+  if (wifi->started) {
+    return WIFI_ERR_FAIL;
+  }
+  if (!wifi->initialized) {
+    wifi->cfg.mode = mode;
+    return WIFI_OK;
+  }
   if (esp_wifi_set_mode(mode) != ESP_OK) {
     return WIFI_ERR_FAIL;
   }
@@ -344,6 +404,13 @@ wifi_err_t wifi_set_mode(wifi_t wifi, wifi_mode_t mode) {
 wifi_err_t wifi_set_ps(wifi_t wifi, wifi_ps_type_t ps_type) {
   if (!wifi) {
     return WIFI_ERR_INVALID_ARG;
+  }
+  if (ps_type > WIFI_PS_MAX_MODEM) {
+    return WIFI_ERR_INVALID_ARG;
+  }
+  if (!wifi->initialized) {
+    wifi->cfg.ps = ps_type;
+    return WIFI_OK;
   }
   if (esp_wifi_set_ps(ps_type) != ESP_OK) {
     return WIFI_ERR_FAIL;
