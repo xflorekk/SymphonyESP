@@ -16,6 +16,12 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 
+#define WIFI_STORAGE_SIZE 512
+
+typedef struct {
+  uint8_t _opaque[WIFI_STORAGE_SIZE];
+} __attribute__((aligned(4))) wifi_handle_storage_t;
+
 /**
  *@brief WIFI handle
  *
@@ -32,6 +38,23 @@ typedef enum {
   WIFI_ERR_FAIL = -2,
 } wifi_err_t;
 
+typedef enum {
+  WIFI_EVT_CONNECTING = 0,
+  WIFI_EVT_CONNECTED,
+  WIFI_EVT_DISCONNECTED,
+  WIFI_EVT_GOT_IP,
+  WIFI_EVT_LOST_IP,
+  WIFI_EVT_FAIL,
+} wifi_evt_t;
+
+typedef struct {
+  esp_ip4_addr_t ip;
+  int reason;
+} wifi_evt_data_t;
+
+typedef void (*wifi_on_event_cb)(void *ctx, wifi_evt_t evt,
+                                 const wifi_evt_data_t *data);
+
 /**
  *@brief WIFI config
  */
@@ -42,6 +65,9 @@ typedef struct {
   wifi_ps_type_t ps;
   uint8_t max_retry;
   bool auto_reconnect;
+
+  wifi_on_event_cb on_event;
+  void *user_ctx;
 } wifi_cfg_t;
 
 /**
@@ -69,12 +95,13 @@ typedef enum {
 } wifi_state_t;
 
 /**
- *@brief Create wifi instance
+ *@brief Init
  */
-wifi_t wifi_create(const wifi_cfg_t *cfg);
+wifi_err_t wifi_init(wifi_handle_storage_t *storage, const wifi_cfg_t *cfg,
+                     wifi_t *out);
 
 /**
- *@brief Destroy wifi instance
+ *@brief Deinit
  */
 wifi_err_t wifi_destroy(wifi_t wifi);
 
