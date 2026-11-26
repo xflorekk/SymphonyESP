@@ -1,4 +1,3 @@
-#include "app_evt.h"
 #include "srv.h"
 #include "wifi.h"
 #include <esp_event.h>
@@ -10,6 +9,7 @@
 
 static const char *TAG = "main";
 static srv_t g_srv = NULL;
+static wifi_handle_storage_t storage;
 
 static void srv_on_connect(void *ctx, int fd) {
   (void)ctx;
@@ -34,6 +34,37 @@ static void srv_on_data(void *ctx, int fd, const char *data, size_t len) {
   }
 }
 
+static void wifi_on_event(void *ctx, wifi_evt_t evt,
+                          const wifi_evt_data_t *evt_data) {
+  (void)ctx;
+  (void)evt_data;
+  switch (evt) {
+  case WIFI_EVT_CONNECTING:
+    ESP_LOGI(TAG, "wifi CONNECTING");
+    break;
+  case WIFI_EVT_CONNECTED:
+    ESP_LOGI(TAG, "wifi CONNECTED");
+    break;
+  case WIFI_EVT_DISCONNECTED:
+    ESP_LOGI(TAG, "wifi DISCONNECTED");
+    break;
+  case WIFI_EVT_GOT_IP:
+    ESP_LOGI(TAG, "wifi GOT IP");
+
+    srv_start(g_srv);
+    break;
+  case WIFI_EVT_LOST_IP:
+    ESP_LOGI(TAG, "wifi LOST IP");
+    break;
+  case WIFI_EVT_FAIL:
+    ESP_LOGI(TAG, "wifi FAIL");
+
+    break;
+  default:
+    break;
+  }
+}
+
 static void main_nop(void) {
   ESP_LOGI(TAG, "nop!");
   for (;;) {
@@ -43,12 +74,6 @@ static void main_nop(void) {
 
 void app_main(void) {
   ESP_ERROR_CHECK(nvs_flash_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-  if (app_evt_init() != ESP_OK) {
-    ESP_LOGE(TAG, "app_evt_init FAIL");
-    main_nop();
-  }
 
   // SRV - tworzymy przed WiFi, ale startujemy dopiero na GOT_IP
   srv_cfg_t srv_cfg = {
@@ -70,19 +95,21 @@ void app_main(void) {
     ESP_LOGE(TAG, "srv_create FAIL");
     main_nop();
   }
-  app_evt_set_srv(g_srv);
 
-  wifi_cfg_t wifi_cfg = {
+  wifi_cfg_t cfg = (wifi_cfg_t){
       .auto_reconnect = true,
       .max_retry = 5,
       .mode = WIFI_MODE_STA,
-      .password = "XXX",
-      .ssid = "XXX",
+      .password = "28567911",
+      .ssid = "fiberway.pl_6c",
       .ps = WIFI_PS_NONE,
+      .on_event = wifi_on_event,
+      .user_ctx = NULL,
   };
-  wifi_t wifi = wifi_create(&wifi_cfg);
-  if (!wifi) {
-    ESP_LOGE(TAG, "wifi_create FAIL");
+  wifi_t wifi = NULL;
+  wifi_err_t werr = wifi_init(&storage, &cfg, &wifi);
+  if (werr != WIFI_OK) {
+    ESP_LOGE(TAG, "init FAIL");
     main_nop();
   }
   if (wifi_start(wifi) != WIFI_OK) {

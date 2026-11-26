@@ -43,7 +43,7 @@ typedef struct {
   uint32_t baud_rate;              /*!< e.g. 115200 */
   uart_word_length_t data_bits;    /*!< e.g. UART_DATA_8_BITS */
   uart_parity_t parity;            /*!< e.g. UART_PARITY_DISABLE */
-  uart_stop_bits_t stop_bits;      /*!< e.g. UART_STOP_1_BIT */
+  uart_stop_bits_t stop_bits;      /*!< e.g. UART_STOP_BITS_1 */
   uart_hw_flowcontrol_t flow_ctrl; /*!< e.g. UART_HW_FLOWCTRL_DISABLE */
   int tx_gpio;                     /*!< TX pin, -1 = not used */
   int rx_gpio;                     /*!< RX pin, -1 = not used */
@@ -70,7 +70,7 @@ typedef struct {
  *@brief Create UART instance
  *
  *@param[in] cfg Configuration, must not be NULL
- *@return UART handleor NULL on failure
+ *@return UART handle or NULL on failure
  */
 uart_t uart_create(const uart_cfg_t *cfg);
 

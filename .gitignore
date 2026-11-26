@@ -1,0 +1,56 @@
+# ESP-IDF build files
+build/
+build_*/
+sdkconfig.old
+sdkconfig.*.old
+managed_components/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Compiled files
+*.o
+*.obj
+*.a
+*.elf
+*.bin
+*.map
+*.hex
+*.d
+
+# VS Code
+.vscode/
+.clangd/
+*.code-workspace
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
