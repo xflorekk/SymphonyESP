@@ -18,10 +18,6 @@
 
 static const char *TAG = "SRV";
 
-#define SRV_STACK_SIZE 8192
-#define SRV_STACK_DEPTH (SRV_STACK_SIZE / sizeof(StackType_t))
-#define SRV_RX_BUF_SIZE 1024
-#define SRV_MAX_CLIENTS 8
 #define SRV_DEFAULT_BACKLOG 5
 #define SRV_SELECT_TIMEOUT_MS 1000
 #define SRV_STOP_TIMEOUT_MS 2000
@@ -36,6 +32,7 @@ static const char *TAG = "SRV";
 typedef struct {
   int fd;
   bool in_use;
+  bool discarding;
   char rx_buf[SRV_RX_BUF_SIZE];
   size_t rx_len;
   TickType_t last_activity;
@@ -44,15 +41,25 @@ typedef struct {
 struct srv_s {
   StackType_t stack[SRV_STACK_DEPTH];
   StaticTask_t tcb;
+  StaticSemaphore_t lock_buf;
+  StaticSemaphore_t stopped_buf;
+  StaticSemaphore_t started_buf;
   TaskHandle_t handle;
   int listen_fd;
   volatile bool running;
   SemaphoreHandle_t lock;
   SemaphoreHandle_t stopped_sem;
+  SemaphoreHandle_t started_sem;
+  bool start_ok;
   srv_cfg_t cfg;
   srv_diag_t diag;
   srv_cli_t cli[SRV_MAX_CLIENTS];
 };
+
+/** @brief Storage must fit `struct srv_s`, otherwise increase
+ * `SRV_STORAGE_SIZE`. */
+_Static_assert(sizeof(struct srv_s) <= sizeof(srv_handle_storage_t),
+               "SRV_STORAGE_SIZE too small");
 
 /* --- helpers, lock must be held unless noted --- */
 
@@ -84,6 +91,7 @@ static int srv_cli_add_locked(srv_t srv, int fd) {
   }
   srv->cli[idx].fd = fd;
   srv->cli[idx].in_use = true;
+  srv->cli[idx].discarding = false;
   srv->cli[idx].rx_len = 0;
   srv->cli[idx].last_activity = xTaskGetTickCount();
   srv->diag.total_connections++;
@@ -130,47 +138,93 @@ static void srv_cli_disconnect_notify(srv_t srv, int fd) {
 static int srv_cli_append_rx_locked(srv_t srv, int idx, const char *data,
                                     size_t len) {
   srv_cli_t *cli = &srv->cli[idx];
-  if (cli->rx_len + len >= SRV_RX_BUF_SIZE) {
+  srv->diag.rx_bytes += len;
+  cli->last_activity = xTaskGetTickCount();
+
+  size_t pos = 0;
+  // 1. Jak zrzucamy poprzednią za długą linię, szukaj \n w nowym chunku
+  if (cli->discarding) {
+    size_t i = 0;
+    for (; i < len; i++) {
+      if (data[i] == '\n') {
+        break;
+      }
+    }
+    if (i == len) {
+      return 0; // dalej brak \n, zrzuć cały chunk
+    }
+    // Koniec zrzucanej linii, reszta po \n to początek nowej linii
+    cli->discarding = false;
     cli->rx_len = 0;
+    pos = i + 1;
+    if (pos >= len) {
+      return 0;
+    }
+  }
+
+  // 2. Normalny append dla reszty data[pos..]
+  size_t rem_len = len - pos;
+  const char *rem_data = data + pos;
+  if (cli->rx_len + rem_len >= SRV_RX_BUF_SIZE) {
+    // Overflow, zacznij zrzucać aż do \n
+    cli->rx_len = 0;
+    cli->discarding = true;
     srv->diag.dropped_lines++;
     ESP_LOGW(TAG, "rx overflow fd=%d, line dropped", cli->fd);
-    return -1;
+    // Może ten sam chunk zawiera \n kończący długą linię?
+    for (size_t i = 0; i < rem_len; i++) {
+      if (rem_data[i] == '\n') {
+        cli->discarding = false;
+        size_t after = rem_len - (i + 1);
+        if (after > 0) {
+          // after < 256, na pewno się mieści bo rx_len == 0
+          memcpy(cli->rx_buf, rem_data + i + 1, after);
+          cli->rx_len = after;
+        }
+        break;
+      }
+    }
+    return 0;
   }
-  memcpy(cli->rx_buf + cli->rx_len, data, len);
-  cli->rx_len += len;
-  cli->last_activity = xTaskGetTickCount();
-  srv->diag.rx_bytes += len;
+
+  memcpy(cli->rx_buf + cli->rx_len, rem_data, rem_len);
+  cli->rx_len += rem_len;
   return 0;
 }
 
 /**
  * @brief Extract one complete line, without \r\n.
- * @return length of line, 0 if no complete line.
- * Caller must provide out buffer with NUL space.
+ * @return -1 no complete line, -2 line too long and dropped,
+ *         >=0 length of delivered line, 0 is valid empty line.
+ * Caller must use return value as len, never strlen().
  */
-static size_t srv_cli_extract_line_locked(srv_t srv, int idx, char *out,
-                                          size_t out_size) {
+static ssize_t srv_cli_extract_line_locked(srv_t srv, int idx, char *out,
+                                           size_t out_size) {
   srv_cli_t *cli = &srv->cli[idx];
   for (size_t i = 0; i < cli->rx_len; i++) {
-    if (cli->rx_buf[i] == '\n') {
-      size_t line_len = i;
-      if (line_len > 0 && cli->rx_buf[line_len - 1] == '\r') {
-        line_len--;
-      }
-      size_t copy_len = line_len;
-      if (copy_len >= out_size) {
-        copy_len = out_size - 1;
-      }
-      memcpy(out, cli->rx_buf, copy_len);
-      out[copy_len] = '\0';
-      size_t remain = cli->rx_len - (i + 1);
+    if (cli->rx_buf[i] != '\n') {
+      continue;
+    }
+    size_t line_len = i;
+    if (line_len > 0 && cli->rx_buf[line_len - 1] == '\r') {
+      line_len--;
+    }
+    size_t remain = cli->rx_len - (i + 1);
+    if (line_len >= out_size) {
+      // Too long, drop whole line, do not deliver truncated copy.
       memmove(cli->rx_buf, cli->rx_buf + i + 1, remain);
       cli->rx_len = remain;
-      srv->diag.rx_lines++;
-      return line_len;
+      srv->diag.dropped_lines++;
+      return -2;
     }
+    memcpy(out, cli->rx_buf, line_len);
+    out[line_len] = '\0';
+    memmove(cli->rx_buf, cli->rx_buf + i + 1, remain);
+    cli->rx_len = remain;
+    srv->diag.rx_lines++;
+    return (ssize_t)line_len; // 0 = empty line, valid
   }
-  return 0;
+  return -1; // no complete line
 }
 
 static void srv_check_idle(srv_t srv, TickType_t now) {
@@ -269,15 +323,12 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
       xSemaphoreGive(srv->lock);
       continue;
     }
-    if (srv_cli_append_rx_locked(srv, idx, tmp, (size_t)r) != 0) {
-      xSemaphoreGive(srv->lock);
-      continue; // overflow, linia zrzucona, klient zostaje
-    }
+    srv_cli_append_rx_locked(srv, idx, tmp, (size_t)r);
     xSemaphoreGive(srv->lock);
 
-    // 4. Wyciągaj linie po jednej, każdą dostarczaj bez locka
+    // 4. Extract lines one by one, deliver without lock
     while (1) {
-      size_t line_len = 0;
+      ssize_t r = -1;
       if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
         break;
       }
@@ -286,13 +337,23 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
         xSemaphoreGive(srv->lock);
         break;
       }
-      line_len = srv_cli_extract_line_locked(srv, idx, line, sizeof(line));
+      r = srv_cli_extract_line_locked(srv, idx, line, sizeof(line));
       xSemaphoreGive(srv->lock);
-      if (line_len == 0) {
-        break;
+      if (r == -1) {
+        break; // no complete line
       }
+      if (r == -2) {
+        continue; // too long, dropped, try next line in same buffer
+      }
+      // r >= 0, 0 = empty line, valid, deliver it
       if (srv->cfg.on_data) {
-        srv->cfg.on_data(srv->cfg.user_ctx, fd, line, strlen(line));
+        srv->cfg.on_data(srv->cfg.user_ctx, fd, line, (size_t)r);
+      } else {
+        // Extracted but no consumer, count as dropped
+        if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+          srv->diag.dropped_lines++;
+          xSemaphoreGive(srv->lock);
+        }
       }
     }
   }
@@ -308,11 +369,14 @@ static void srv_task(void *pvParameters) {
   int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
   if (listen_fd < 0) {
     ESP_LOGE(TAG, "socket failed errno=%d", errno);
+    srv->start_ok = false;
+    xSemaphoreGive(srv->started_sem);
     srv->running = false;
     xSemaphoreGive(srv->stopped_sem);
     vTaskDelete(NULL);
     return;
   }
+
   srv->listen_fd = listen_fd;
   int opt = 1;
   setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -321,28 +385,39 @@ static void srv_task(void *pvParameters) {
   srv_addr.sin_family = AF_INET;
   srv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
   srv_addr.sin_port = htons(srv->cfg.port);
+
   if (bind(listen_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) != 0) {
     ESP_LOGE(TAG, "bind port %u failed errno=%d", srv->cfg.port, errno);
     close(listen_fd);
     srv->listen_fd = -1;
+    srv->start_ok = false;
+    xSemaphoreGive(srv->started_sem);
     srv->running = false;
     xSemaphoreGive(srv->stopped_sem);
     vTaskDelete(NULL);
     return;
   }
+
   if (listen(listen_fd, srv->cfg.backlog) != 0) {
     ESP_LOGE(TAG, "listen failed errno=%d", errno);
     close(listen_fd);
     srv->listen_fd = -1;
+    srv->start_ok = false;
+    xSemaphoreGive(srv->started_sem);
     srv->running = false;
     xSemaphoreGive(srv->stopped_sem);
     vTaskDelete(NULL);
     return;
   }
+
   int flags = fcntl(listen_fd, F_GETFL, 0);
   fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
+
   ESP_LOGI(TAG, "listening on port %u, max %u", srv->cfg.port,
            srv->cfg.max_clients);
+  srv->start_ok = true;
+  xSemaphoreGive(srv->started_sem);
+
   while (srv->running) {
     fd_set read_fds;
     FD_ZERO(&read_fds);
@@ -425,7 +500,6 @@ static void srv_task(void *pvParameters) {
   ESP_LOGI(TAG, "task cleanup");
   close(listen_fd);
   srv->listen_fd = -1;
-  // Close all clients, collect for notify outside lock.
   int to_close[SRV_MAX_CLIENTS];
   int n_close = 0;
   if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -441,38 +515,37 @@ static void srv_task(void *pvParameters) {
     close(to_close[i]);
     srv_cli_disconnect_notify(srv, to_close[i]);
   }
-  srv->handle = NULL;
   srv->running = false;
+  srv->handle = NULL;
   xSemaphoreGive(srv->stopped_sem);
   vTaskDelete(NULL);
 }
 
 /* --- public API --- */
 
-srv_t srv_create(const srv_cfg_t *cfg) {
-  if (!cfg) {
-    return NULL;
+srv_err_t srv_init(srv_handle_storage_t *storage, const srv_cfg_t *cfg,
+                   srv_t *out) {
+  if (!storage || !cfg || !out) {
+    return SRV_ERR_INVALID_ARG;
   }
   if (cfg->port == 0) {
     ESP_LOGE(TAG, "invalid port 0");
-    return NULL;
+    return SRV_ERR_INVALID_ARG;
   }
   if (cfg->max_clients == 0 || cfg->max_clients > SRV_MAX_CLIENTS) {
     ESP_LOGE(TAG, "invalid max_clients %u", cfg->max_clients);
-    return NULL;
+    return SRV_ERR_INVALID_ARG;
   }
   if (cfg->stack_size != 0 && cfg->stack_size != SRV_STACK_SIZE) {
     ESP_LOGE(TAG, "stack_size must be 0 or %d", SRV_STACK_SIZE);
-    return NULL;
+    return SRV_ERR_INVALID_ARG;
   }
   if (cfg->rx_buf_size != 0 && cfg->rx_buf_size != SRV_RX_BUF_SIZE) {
     ESP_LOGE(TAG, "rx_buf_size must be 0 or %d", SRV_RX_BUF_SIZE);
-    return NULL;
+    return SRV_ERR_INVALID_ARG;
   }
-  srv_t srv = (srv_t)calloc(1, sizeof(struct srv_s));
-  if (!srv) {
-    return NULL;
-  }
+  struct srv_s *srv = (struct srv_s *)storage;
+  memset(srv, 0, sizeof(*srv));
   srv->cfg = *cfg;
   if (srv->cfg.backlog <= 0) {
     srv->cfg.backlog = SRV_DEFAULT_BACKLOG;
@@ -483,6 +556,12 @@ srv_t srv_create(const srv_cfg_t *cfg) {
   if (srv->cfg.rx_buf_size == 0) {
     srv->cfg.rx_buf_size = SRV_RX_BUF_SIZE;
   }
+  if (srv->cfg.priority == 0) {
+    srv->cfg.priority = 5;
+  }
+  if (srv->cfg.core_id > 1) {
+    return SRV_ERR_INVALID_ARG;
+  }
   srv->listen_fd = -1;
   srv->running = false;
   srv->handle = NULL;
@@ -491,34 +570,34 @@ srv_t srv_create(const srv_cfg_t *cfg) {
     srv->cli[i].in_use = false;
     srv->cli[i].rx_len = 0;
   }
-  srv->lock = xSemaphoreCreateMutex();
-  if (!srv->lock) {
-    free(srv);
-    return NULL;
+  srv->lock = xSemaphoreCreateMutexStatic(&srv->lock_buf);
+  srv->stopped_sem = xSemaphoreCreateBinaryStatic(&srv->stopped_buf);
+  srv->started_sem = xSemaphoreCreateBinaryStatic(&srv->started_buf);
+  if (!srv->lock || !srv->stopped_sem || !srv->started_sem) {
+    return SRV_ERR_FAIL;
   }
-  srv->stopped_sem = xSemaphoreCreateBinary();
-  if (!srv->stopped_sem) {
-    vSemaphoreDelete(srv->lock);
-    free(srv);
-    return NULL;
-  }
-  return srv;
+  srv->start_ok = false;
+  *out = srv;
+  return SRV_OK;
 }
 
-srv_err_t srv_destroy(srv_t srv) {
+srv_err_t srv_deinit(srv_t srv) {
   if (!srv) {
     return SRV_ERR_INVALID_ARG;
   }
   if (srv->running) {
     srv_stop(srv);
+  } else if (srv->handle != NULL) {
+    xSemaphoreTake(srv->stopped_sem, pdMS_TO_TICKS(SRV_STOP_TIMEOUT_MS));
+    srv->handle = NULL;
   }
-  if (srv->lock) {
-    vSemaphoreDelete(srv->lock);
-  }
-  if (srv->stopped_sem) {
-    vSemaphoreDelete(srv->stopped_sem);
-  }
-  free(srv);
+  srv->lock = NULL;
+  srv->stopped_sem = NULL;
+  srv->started_sem = NULL;
+  srv->handle = NULL;
+  srv->listen_fd = -1;
+  srv->running = false;
+  srv->start_ok = false;
   return SRV_OK;
 }
 
@@ -526,11 +605,15 @@ srv_err_t srv_start(srv_t srv) {
   if (!srv) {
     return SRV_ERR_INVALID_ARG;
   }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
+    return SRV_ERR_INVALID_ARG;
+  }
   if (srv->running) {
     return SRV_ERR_ALREADY_STARTED;
   }
-  // Drain stopped_sem from previous run, so stop() does not take stale signal.
   xSemaphoreTake(srv->stopped_sem, 0);
+  xSemaphoreTake(srv->started_sem, 0);
+  srv->start_ok = false;
   srv->running = true;
   srv->handle = xTaskCreateStaticPinnedToCore(
       srv_task, "srv", SRV_STACK_DEPTH, srv, srv->cfg.priority, srv->stack,
@@ -540,11 +623,30 @@ srv_err_t srv_start(srv_t srv) {
     ESP_LOGE(TAG, "xTaskCreateStatic failed");
     return SRV_ERR_FAIL;
   }
+  if (xSemaphoreTake(srv->started_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    ESP_LOGE(TAG, "srv task did not report start");
+    srv->running = false;
+    if (srv->listen_fd != -1) {
+      shutdown(srv->listen_fd, SHUT_RDWR);
+    }
+    xSemaphoreTake(srv->stopped_sem, pdMS_TO_TICKS(1000));
+    srv->handle = NULL;
+    return SRV_ERR_FAIL;
+  }
+  if (!srv->start_ok) {
+    xSemaphoreTake(srv->stopped_sem, pdMS_TO_TICKS(1000));
+    srv->running = false;
+    srv->handle = NULL;
+    return SRV_ERR_FAIL;
+  }
   return SRV_OK;
 }
 
 srv_err_t srv_stop(srv_t srv) {
   if (!srv) {
+    return SRV_ERR_INVALID_ARG;
+  }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
     return SRV_ERR_INVALID_ARG;
   }
   if (!srv->running) {
@@ -559,6 +661,7 @@ srv_err_t srv_stop(srv_t srv) {
     ESP_LOGE(TAG, "srv task did not exit in %d ms", SRV_STOP_TIMEOUT_MS);
     return SRV_ERR_FAIL;
   }
+  srv->handle = NULL;
   return SRV_OK;
 }
 
@@ -571,6 +674,9 @@ bool srv_is_running(srv_t srv) {
 
 srv_err_t srv_send_to(srv_t srv, int fd, const char *data, size_t len) {
   if (!srv || !data || len == 0) {
+    return SRV_ERR_INVALID_ARG;
+  }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
     return SRV_ERR_INVALID_ARG;
   }
   if (!srv->running) {
@@ -616,6 +722,9 @@ srv_err_t srv_send_all(srv_t srv, const char *data, size_t len) {
   if (!srv || !data || len == 0) {
     return SRV_ERR_INVALID_ARG;
   }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
+    return SRV_ERR_INVALID_ARG;
+  }
   if (!srv->running) {
     return SRV_ERR_NOT_STARTED;
   }
@@ -656,20 +765,26 @@ srv_err_t srv_send_all(srv_t srv, const char *data, size_t len) {
   return SRV_OK;
 }
 
-srv_diag_t srv_get_diag(srv_t srv) {
-  srv_diag_t empty = {0};
-  if (!srv) {
-    return empty;
+srv_err_t srv_get_diag(srv_t srv, srv_diag_t *out) {
+  if (!srv || !out) {
+    return SRV_ERR_INVALID_ARG;
   }
-  if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-    empty = srv->diag;
-    xSemaphoreGive(srv->lock);
+  if (!srv->lock) {
+    return SRV_ERR_INVALID_ARG;
   }
-  return empty;
+  if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+    return SRV_ERR_FAIL;
+  }
+  *out = srv->diag;
+  xSemaphoreGive(srv->lock);
+  return SRV_OK;
 }
 
 srv_err_t srv_reset_diag(srv_t srv) {
   if (!srv) {
+    return SRV_ERR_INVALID_ARG;
+  }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
     return SRV_ERR_INVALID_ARG;
   }
   if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -680,4 +795,27 @@ srv_err_t srv_reset_diag(srv_t srv) {
   srv->diag.current_clients = cur;
   xSemaphoreGive(srv->lock);
   return SRV_OK;
+}
+
+const char *srv_err_to_str(srv_err_t err) {
+  switch (err) {
+  case SRV_OK:
+    return "OK";
+  case SRV_ERR_INVALID_ARG:
+    return "INVALID_ARG";
+  case SRV_ERR_FAIL:
+    return "FAIL";
+  case SRV_ERR_NO_MEM:
+    return "NO_MEM";
+  case SRV_ERR_ALREADY_STARTED:
+    return "ALREADY_STARTED";
+  case SRV_ERR_NOT_STARTED:
+    return "NOT_STARTED";
+  case SRV_ERR_NO_CLIENT:
+    return "NO_CLIENT";
+  case SRV_ERR_WOULD_BLOCK:
+    return "WOULD_BLOCK";
+  default:
+    return "UNKNOWN";
+  }
 }

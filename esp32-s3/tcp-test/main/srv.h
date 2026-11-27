@@ -1,7 +1,7 @@
 /*
- * SPDX-FileCopyrightText: 2026 Maciek Pollok
+ * SPDX-FileCopyrightText: 2026 Maciej Pollok, Daniel Florek
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  */
 #ifndef SRV_H
 #define SRV_H
@@ -14,6 +14,23 @@ extern "C" {
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#define SRV_STACK_SIZE 16384
+#define SRV_STACK_DEPTH (SRV_STACK_SIZE / sizeof(StackType_t))
+#define SRV_RX_BUF_SIZE 1024
+#define SRV_STORAGE_SIZE 25600
+#define SRV_MAX_CLIENTS 8
+
+/**
+ * @brief Static storage for handle.
+ *
+ * @details App allocates this statically, e.g. `static srv_storage_t
+ * storage;` and passes it to @ref wifi_init. Content is opaque, do not touch
+ * manually. 4-byte alignment required, struct contains pointers.
+ */
+typedef struct {
+  uint8_t _opaque[SRV_STORAGE_SIZE];
+} __attribute__((aligned(8))) srv_handle_storage_t;
 
 /**
  * @brief Handle is opaque.
@@ -110,30 +127,10 @@ typedef struct {
   uint32_t dropped_lines; /**< Lines dropped, RX overflow or on_data == NULL. */
 } srv_diag_t;
 
-/**
- * @brief Create server instance.
- *
- * @param cfg Server configuration, must not be NULL. Copied internally.
- *
- * @return srv_t handle on success, NULL on invalid config or out of memory.
- *
- * @note Does not start listening. Call srv_start() after create.
- *       Allocates handle + client pool for cfg->max_clients.
- */
-srv_t srv_create(const srv_cfg_t *cfg);
+srv_err_t srv_init(srv_handle_storage_t *storage, const srv_cfg_t *cfg,
+                   srv_t *out);
 
-/**
- * @brief Destroy server instance.
- *
- * @param srv Server handle from srv_create().
- *
- * @return SRV_OK on success, SRV_ERR_INVALID_ARG if srv is NULL.
- *
- * @note If server is running, it is stopped first and the call blocks
- *       until srv task exits. Must not be called from srv callbacks,
- *       it would deadlock.
- */
-srv_err_t srv_destroy(srv_t srv);
+srv_err_t srv_deinit(srv_t srv);
 
 /**
  * @brief Start server.
@@ -224,7 +221,7 @@ srv_err_t srv_send_all(srv_t srv, const char *data, size_t len);
  *
  * @note Thread-safe.
  */
-srv_diag_t srv_get_diag(srv_t srv);
+srv_err_t srv_get_diag(srv_t srv, srv_diag_t *out);
 
 /**
  * @brief Reset diagnostics.
@@ -237,6 +234,8 @@ srv_diag_t srv_get_diag(srv_t srv);
  *       real state, not a counter.
  */
 srv_err_t srv_reset_diag(srv_t srv);
+
+const char *srv_err_to_str(srv_err_t err);
 
 #ifdef __cplusplus
 }
