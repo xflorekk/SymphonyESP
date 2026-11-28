@@ -3,22 +3,41 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+
+/**
+ * @file wifi.c
+ * @brief WiFi STA implementation, see wifi.h.
+ *
+ * @details
+ * - `wifi_event_handler` is the only ESP handler, maps `WIFI_EVENT` /
+ * `IP_EVENT` to @ref wifi_evt_t and calls `on_event`.
+ * - Reconnect is done in wifi.c, app only reacts to events.
+ * - `wifi_stop` sets `started=false` before `esp_wifi_stop`, otherwise
+ *   `DISCONNECTED` handler would do false reconnect after intentional stop.
+ * - `wifi_cleanup_initialized` is shared cleanup for `wifi_destroy` and error
+ * path in `wifi_start`.
+ */
 #include "wifi.h"
-#include "esp_wifi_types_generic.h"
-#include "stdio.h"
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <esp_wifi.h>
+#include <esp_wifi_types_generic.h>
 #include <freertos/FreeRTOS.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/** @brief Log tag for this file. */
 static const char *TAG = "WIFI";
 
+/** @brief 1 = debug logs enabled, 0 = disabled. */
 #define WIFI_DEBUG 1
 #if WIFI_DEBUG
+/** @brief Wrapper for `ESP_LOGI` with built-in `TAG`. */
 #define WIFI_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+/** @brief Wrapper for `ESP_LOGW` with built-in `TAG`. */
 #define WIFI_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+/** @brief Wrapper for `ESP_LOGE` with built-in `TAG`. */
 #define WIFI_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
 #else
 #define WIFI_LOGI(...)                                                         \
@@ -33,26 +52,49 @@ static const char *TAG = "WIFI";
 #endif
 
 /**
- * @brief Private definition of WIFI handle
- *
- * Defined only here, not in wifi.h
+ * @brief Private handle definition, only here, not in wifi.h.
  */
 struct wifi_s {
-  wifi_cfg_t cfg;
-  wifi_state_t state;
-  wifi_diag_t diag;
-  bool started;
-  bool initialized;
-  esp_netif_t *netif;
-  uint8_t retry;
-  char ip_str[16];
-  esp_event_handler_instance_t wifi_handler;
-  esp_event_handler_instance_t ip_handler;
+  wifi_cfg_t cfg;     /**< Copy of cfg from `wifi_init`, including callback. */
+  wifi_state_t state; /**< Current state, updated in handler. */
+  wifi_diag_t diag;   /**< Counters, updated in handler / `wifi_get_rssi`. */
+  bool started;       /**< True after successful `wifi_start`, false after
+                         `wifi_stop`. */
+  bool initialized;   /**< True after successful `esp_wifi_init` + handler
+                         registration. */
+  esp_netif_t *netif; /**< STA netif, NULL before `start` / after `destroy`. */
+  uint8_t retry;   /**< Current retry counter, reset on `CONNECTED` / `GOT_IP` /
+                      `start` / `stop`. */
+  char ip_str[16]; /**< Last IP as string, empty if no IP. */
+  esp_event_handler_instance_t
+      wifi_handler; /**< `WIFI_EVENT` handler, NULL if not registered. */
+  esp_event_handler_instance_t
+      ip_handler; /**< `IP_EVENT` handler, NULL if not registered. */
 };
 
+/** @brief Storage must fit `struct wifi_s`, otherwise increase
+ * `WIFI_STORAGE_SIZE`. */
 _Static_assert(sizeof(struct wifi_s) <= sizeof(wifi_handle_storage_t),
                "WIFI_STORAGE_SIZE too small");
 
+/**
+ * @brief ESP event handler, maps to `wifi_evt_t`.
+ *
+ * @param arg Handle `wifi_t`, passed on registration.
+ * @param event_base `WIFI_EVENT` or `IP_EVENT`.
+ * @param event_id Event ID within base.
+ * @param event_data ESP data, e.g. `wifi_event_sta_disconnected_t`,
+ * `ip_event_got_ip_t`.
+ *
+ * @details
+ * - `STA_START` -> `CONNECTING`, `connect_cnt++`, `esp_wifi_connect`.
+ * - `STA_CONNECTED` -> `CONNECTED`, `retry=0`.
+ * - `STA_DISCONNECTED` -> `DISCONNECTED`, `disconnect_cnt++`, event to app,
+ *   then if `!started` -> `IDLE` and break (intentional stop, no reconnect),
+ *   else reconnect or `FAIL` after `max_retry` exceeded.
+ * - `GOT_IP` -> `GOT_IP`, `got_ip_cnt++`, `ip_str`, event to app.
+ * - `LOST_IP` -> `DISCONNECTED`, clears `ip_str`.
+ */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data) {
   wifi_t wifi = (wifi_t)arg;
@@ -161,6 +203,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
   }
 }
 
+/**
+ * @brief Applies `cfg.ssid` / `cfg.password` to ESP.
+ *
+ * @param wifi Handle.
+ * @return `ESP_OK` or `ESP_ERR_INVALID_ARG` / error from `esp_wifi_set_config`.
+ *
+ * @note Currently hardcoded `WIFI_AUTH_WPA2_PSK`, PMF capable, not required.
+ * Open network / WPA3 is TODO, do not touch now.
+ */
 static esp_err_t wifi_apply_config(wifi_t wifi) {
   size_t ssid_len = strnlen(wifi->cfg.ssid, sizeof(wifi->cfg.ssid));
   size_t pass_len = strnlen(wifi->cfg.password, sizeof(wifi->cfg.password));
@@ -175,6 +226,16 @@ static esp_err_t wifi_apply_config(wifi_t wifi) {
   wifi_config.sta.pmf_cfg.required = false;
   return esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
 }
+
+/**
+ * @brief Cleanup after `esp_wifi_init`, unregister + deinit + destroy netif.
+ *
+ * @param wifi Handle.
+ *
+ * @details Called from @ref wifi_destroy and error path in @ref wifi_start.
+ * Does not touch event loop, it is global loop. Sets `initialized=false`,
+ * `netif=NULL`, handlers to NULL.
+ */
 static void wifi_cleanup_initialized(wifi_t wifi) {
   if (wifi->wifi_handler) {
     esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
@@ -304,6 +365,12 @@ wifi_err_t wifi_start(wifi_t wifi) {
   return WIFI_OK;
 }
 
+/**
+ * @brief Stop, see wifi.h.
+ *
+ * @details `started=false` before `esp_wifi_stop`, otherwise `DISCONNECTED`
+ * handler would do false reconnect.
+ */
 wifi_err_t wifi_stop(wifi_t wifi) {
   if (!wifi) {
     return WIFI_ERR_INVALID_ARG;
@@ -312,7 +379,7 @@ wifi_err_t wifi_stop(wifi_t wifi) {
     wifi->state = WIFI_STATE_IDLE;
     return WIFI_OK;
   }
-  // WAZNE: przed esp_wifi_stop, zeby handler DISCONNECTED widzial stop
+  // IMPORTANT: before esp_wifi_stop, so DISCONNECTED handler sees stop
   wifi->started = false;
   wifi->state = WIFI_STATE_IDLE;
   wifi->retry = 0;
@@ -324,6 +391,7 @@ wifi_err_t wifi_stop(wifi_t wifi) {
   }
   return WIFI_OK;
 }
+
 wifi_err_t wifi_connect(wifi_t wifi) {
   if (!wifi) {
     return WIFI_ERR_INVALID_ARG;

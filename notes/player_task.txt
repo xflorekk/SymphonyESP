@@ -1,0 +1,45 @@
+state machine:
+IDLE
+CONFIGURING
+BUFFERING
+PLAYING
+SHUTDOWN
+
+commands:
+SHUTDOWN - command for changing sources, also before configuration state
+PLAY - sets target playing = true
+STOP - clears target playing = false
+CONFIGURE - sends format, sample rate from SRC!!!
+
+events:
+STOPPED - is in IDLE, CONFIGURING, does not have parameters set for decoder, i2s
+READY - parameters are set (format, i2s), ie. mp3, 44.1kHz
+ERROR
+
+STATE MACHINE - FLOW GRAPH:
+START =======>	IDLE  			=================> CONFIGURING 
+		default state				   set set sample rate, format
+		i2s, decoder off			   need_config = false 	   
+		set flag need_config!!!			   player -> ready
+		even if playing == true			   target playing should be set globally by app
+		need config cannot allow for   <-----------if (!playing)  
+		playing					   if (playing)
+								|
+								|
+								|
+								|
+								V
+							   BUFFERING
+							   receiving and decoding data
+							   storing data,
+								|
+								|
+								|
+								V
+							   PLAYING
+							   write i2s, decode 
+	
+	SHUTDOWN - cmd should be treated as INTERRUPTION and should be serviced from any state
+			AFTER SHUTDOWN always go to IDLE
+			Every other state can be ONLY changed in STATE MACHINE, not by command!!!
+			based on the target playing, flag need_config, 

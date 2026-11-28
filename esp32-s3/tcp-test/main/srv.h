@@ -1,7 +1,20 @@
 /*
- * SPDX-FileCopyrightText: 2026 Maciek Pollok
+ * SPDX-FileCopyrightText: 2026 Maciej Pollok, Daniel Florek
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
+ */
+/**
+ * @file srv.h
+ * @brief TCP line server, static allocation, single task.
+ *
+ * @details Server accepts TCP clients, splits incoming stream into lines
+ * terminated by `\n`, strips trailing `\r`, and delivers each complete line
+ * via @ref srv_on_data_cb_t. Long lines are dropped, never truncated.
+ * All state lives in caller-provided static storage, no `malloc` / `free`
+ * in @ref srv_init / @ref srv_start / @ref srv_stop.
+ *
+ * @defgroup srv TCP server
+ * @{
  */
 #ifndef SRV_H
 #define SRV_H
@@ -15,10 +28,34 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 
+/** @brief srv task stack in bytes. Used when srv_cfg_t.stack_size is 0. */
+#define SRV_STACK_SIZE 16384
+/** @brief srv task stack depth in StackType_t words. */
+#define SRV_STACK_DEPTH (SRV_STACK_SIZE / sizeof(StackType_t))
+/** @brief Per-client RX line buffer in bytes. Used when srv_cfg_t.rx_buf_size
+ * is 0. */
+#define SRV_RX_BUF_SIZE 1024
+/** @brief Size of opaque static storage, must fit struct srv_s in srv.c. */
+#define SRV_STORAGE_SIZE 25600
+/** @brief Maximum number of simultaneous clients. */
+#define SRV_MAX_CLIENTS 8
+
+/**
+ * @brief Static storage for handle.
+ *
+ * @details App allocates this statically, e.g. `static srv_handle_storage_t
+ * storage;` and passes it to @ref srv_init. Content is opaque, do not touch
+ * manually. 8-byte alignment required, struct contains pointers and FreeRTOS
+ * TCB.
+ */
+typedef struct {
+  uint8_t _opaque[SRV_STORAGE_SIZE];
+} __attribute__((aligned(8))) srv_handle_storage_t;
+
 /**
  * @brief Handle is opaque.
  *
- * Created by srv_create(), destroyed by srv_destroy().
+ * Created by @ref srv_init(), released by @ref srv_deinit().
  * All state, including client pool, task stack and sockets,
  * is private in srv.c. Never dereference it.
  */
@@ -46,12 +83,12 @@ typedef enum {
  *
  * @param user_ctx User context from srv_cfg_t.user_ctx.
  * @param fd Client socket descriptor, valid only during the call.
- * @param data One complete line, without trailing \r\n. Not necessarily
+ * @param data One complete line, without trailing `\r\n`. Not necessarily
  *             NUL-terminated, always use @p len.
- * @param len Length of @p data in bytes, without trailing \r\n.
+ * @param len Length of @p data in bytes, without trailing `\r\n`.
  *
  * @note Called in srv task context. Must not block, must not call
- *       srv_stop(), srv_destroy() or vTaskDelay(). Use srv_send_to()
+ *       srv_stop(), srv_deinit() or vTaskDelay(). Use srv_send_to()
  *       for a reply, it is thread-safe and non-blocking.
  */
 typedef void (*srv_on_data_cb_t)(void *user_ctx, int fd, const char *data,
@@ -66,30 +103,30 @@ typedef void (*srv_on_data_cb_t)(void *user_ctx, int fd, const char *data,
  *           on_disconnect it is already closed and must not be used.
  *
  * @note Called in srv task context. Must not block, must not call
- *       srv_stop() or srv_destroy().
+ *       srv_stop() or srv_deinit().
  */
 typedef void (*srv_on_client_cb_t)(void *user_ctx, int fd);
 
 /**
  * @brief Server configuration.
  *
- * Copied by srv_create(), caller may free its copy after the call.
+ * Copied by @ref srv_init(), caller may free its copy after the call.
  */
 typedef struct {
-  uint16_t port;            /**< TCP listen port. 0 is invalid. */
-  uint8_t max_clients;      /**< Max simultaneous clients. 0 is invalid, 1..16
-                               recommended. */
-  int backlog;              /**< listen() backlog. 0 means default 5. */
+  uint16_t port;       /**< TCP listen port. 0 is invalid. */
+  uint8_t max_clients; /**< Max simultaneous clients. 0 is invalid, 1..8. */
+  int backlog;         /**< listen() backlog. 0 means default 5. */
   srv_on_data_cb_t on_data; /**< Called for each complete line. May be NULL,
                                lines are then dropped. */
   srv_on_client_cb_t on_connect;    /**< Called after accept(). May be NULL. */
   srv_on_client_cb_t on_disconnect; /**< Called after close(). May be NULL. */
   void *user_ctx;                   /**< Passed to all callbacks. */
-  uint32_t stack_size;  /**< srv task stack in bytes. 0 means default 8192. */
+  uint32_t stack_size; /**< srv task stack in bytes. 0 means default 16384. Must
+                          be 0 or SRV_STACK_SIZE. */
   UBaseType_t priority; /**< srv task priority. 0 means default 5. */
   UBaseType_t core_id;  /**< Core for srv task, 0 or 1. */
   size_t rx_buf_size;   /**< Per-client RX line buffer in bytes. 0 means default
-                           1024. Must be >= 128. */
+                           1024. Must be 0 or SRV_RX_BUF_SIZE. */
   uint32_t idle_timeout_ms; /**< Disconnect client after this inactivity. 0
                                means disabled. */
 } srv_cfg_t;
@@ -97,43 +134,48 @@ typedef struct {
 /**
  * @brief Server diagnostics.
  *
- * Copy returned by srv_get_diag(). Counters are updated from srv task
+ * Filled by @ref srv_get_diag(). Counters are updated from srv task
  * and from srv_send_to() / srv_send_all(), reads are thread-safe.
  */
 typedef struct {
-  uint32_t total_connections; /**< Total accepted connections since create or
-                                 reset. */
-  uint32_t current_clients;   /**< Currently connected clients. */
-  uint32_t rx_bytes;          /**< Total bytes received. */
-  uint32_t tx_bytes;          /**< Total bytes sent. */
-  uint32_t rx_lines;          /**< Total complete lines delivered to on_data. */
+  uint32_t
+      total_connections; /**< Total accepted connections since init or reset. */
+  uint32_t current_clients; /**< Currently connected clients. */
+  uint32_t rx_bytes;        /**< Total bytes received. */
+  uint32_t tx_bytes;        /**< Total bytes sent. */
+  uint32_t rx_lines;        /**< Total complete lines delivered to on_data. */
   uint32_t dropped_lines; /**< Lines dropped, RX overflow or on_data == NULL. */
 } srv_diag_t;
 
 /**
- * @brief Create server instance.
+ * @brief Init server in caller-provided static storage.
  *
- * @param cfg Server configuration, must not be NULL. Copied internally.
+ * @param storage Pointer to static storage, must live as long as handle is
+ * used.
+ * @param cfg Server configuration, copied internally.
+ * @param out On success, receives handle pointing to @p storage.
  *
- * @return srv_t handle on success, NULL on invalid config or out of memory.
+ * @return SRV_OK on success,
+ *         SRV_ERR_INVALID_ARG if storage, cfg or out is NULL, or cfg is
+ * invalid.
  *
- * @note Does not start listening. Call srv_start() after create.
- *       Allocates handle + client pool for cfg->max_clients.
+ * @note No heap allocation. May be called again on same storage after
+ * srv_deinit().
  */
-srv_t srv_create(const srv_cfg_t *cfg);
+srv_err_t srv_init(srv_handle_storage_t *storage, const srv_cfg_t *cfg,
+                   srv_t *out);
 
 /**
- * @brief Destroy server instance.
+ * @brief Deinit server, zero only handlers.
  *
- * @param srv Server handle from srv_create().
+ * @param srv Server handle from srv_init().
  *
  * @return SRV_OK on success, SRV_ERR_INVALID_ARG if srv is NULL.
  *
- * @note If server is running, it is stopped first and the call blocks
- *       until srv task exits. Must not be called from srv callbacks,
- *       it would deadlock.
+ * @note Stops server if running. Storage itself is not freed, it lives in
+ * caller. After deinit, srv_init() may be called again on same storage.
  */
-srv_err_t srv_destroy(srv_t srv);
+srv_err_t srv_deinit(srv_t srv);
 
 /**
  * @brief Start server.
@@ -144,7 +186,7 @@ srv_err_t srv_destroy(srv_t srv);
  * @param srv Server handle.
  *
  * @return SRV_OK on success,
- *         SRV_ERR_INVALID_ARG if srv is NULL,
+ *         SRV_ERR_INVALID_ARG if srv is NULL or not initialized,
  *         SRV_ERR_ALREADY_STARTED if already running,
  *         SRV_ERR_FAIL if socket / bind / listen / task creation fails.
  */
@@ -159,7 +201,7 @@ srv_err_t srv_start(srv_t srv);
  * @param srv Server handle.
  *
  * @return SRV_OK on success,
- *         SRV_ERR_INVALID_ARG if srv is NULL,
+ *         SRV_ERR_INVALID_ARG if srv is NULL or not initialized,
  *         SRV_ERR_NOT_STARTED if not running.
  *
  * @note Must not be called from srv callbacks, it would deadlock.
@@ -219,27 +261,42 @@ srv_err_t srv_send_all(srv_t srv, const char *data, size_t len);
  * @brief Get a copy of diagnostics.
  *
  * @param srv Server handle.
+ * @param out Pointer to struct to fill.
  *
- * @return Copy of srv_diag_t. Returns zeroed struct if srv is NULL.
+ * @return SRV_OK on success,
+ *         SRV_ERR_INVALID_ARG if srv or out is NULL or not initialized,
+ *         SRV_ERR_FAIL if lock timeout.
  *
  * @note Thread-safe.
  */
-srv_diag_t srv_get_diag(srv_t srv);
+srv_err_t srv_get_diag(srv_t srv, srv_diag_t *out);
 
 /**
  * @brief Reset diagnostics.
  *
  * @param srv Server handle.
  *
- * @return SRV_OK on success, SRV_ERR_INVALID_ARG if srv is NULL.
+ * @return SRV_OK on success,
+ *         SRV_ERR_INVALID_ARG if srv is NULL or not initialized,
+ *         SRV_ERR_FAIL if lock timeout.
  *
  * @note Thread-safe. Does not reset current_clients, it reflects
  *       real state, not a counter.
  */
 srv_err_t srv_reset_diag(srv_t srv);
 
+/**
+ * @brief Convert error code to human readable string.
+ *
+ * @param err Error code from srv API.
+ *
+ * @return Static string, never NULL, e.g. "OK", "FAIL", "INVALID_ARG".
+ */
+const char *srv_err_to_str(srv_err_t err);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif // SRV_H
+       /** @} */

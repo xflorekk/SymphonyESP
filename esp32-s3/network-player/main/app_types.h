@@ -62,11 +62,6 @@ typedef enum {
   (CFG_NET_SRV_IP | CFG_NET_SRV_PORT | CFG_NET_SRV_FORMAT | CFG_NET_SRV_RATE)
 #define CFG_BT_RCV_REQUIRED (CFG_BT_RCV_FORMAT | CFG_BT_RCV_RATE)
 
-typedef enum {
-  PLAYER_FORMAT_PCM = 0,
-  PLAYER_FORMAT_MP3,
-} player_format_t;
-
 typedef struct {
   char srv_ip[32];
   uint16_t srv_port;

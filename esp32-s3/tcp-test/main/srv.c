@@ -3,6 +3,15 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+/**
+ * @file srv.c
+ * @brief TCP line server implementation, static allocation.
+ *
+ * @details Single srv task owns listen socket, select() loop and client
+ * RX buffers. srv_send_to() / srv_send_all() may be called from any task,
+ * they use the same mutex as the task. All state lives in
+ * srv_handle_storage_t provided by the app, no heap allocation.
+ */
 #include "srv.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -18,10 +27,6 @@
 
 static const char *TAG = "SRV";
 
-#define SRV_STACK_SIZE 8192
-#define SRV_STACK_DEPTH (SRV_STACK_SIZE / sizeof(StackType_t))
-#define SRV_RX_BUF_SIZE 1024
-#define SRV_MAX_CLIENTS 8
 #define SRV_DEFAULT_BACKLOG 5
 #define SRV_SELECT_TIMEOUT_MS 1000
 #define SRV_STOP_TIMEOUT_MS 2000
@@ -36,6 +41,7 @@ static const char *TAG = "SRV";
 typedef struct {
   int fd;
   bool in_use;
+  bool discarding;
   char rx_buf[SRV_RX_BUF_SIZE];
   size_t rx_len;
   TickType_t last_activity;
@@ -44,18 +50,33 @@ typedef struct {
 struct srv_s {
   StackType_t stack[SRV_STACK_DEPTH];
   StaticTask_t tcb;
+  StaticSemaphore_t lock_buf;
+  StaticSemaphore_t stopped_buf;
+  StaticSemaphore_t started_buf;
   TaskHandle_t handle;
   int listen_fd;
   volatile bool running;
   SemaphoreHandle_t lock;
   SemaphoreHandle_t stopped_sem;
+  SemaphoreHandle_t started_sem;
+  bool start_ok;
   srv_cfg_t cfg;
   srv_diag_t diag;
   srv_cli_t cli[SRV_MAX_CLIENTS];
 };
 
+/** @brief Storage must fit `struct srv_s`, otherwise increase
+ * `SRV_STORAGE_SIZE`. */
+_Static_assert(sizeof(struct srv_s) <= sizeof(srv_handle_storage_t),
+               "SRV_STORAGE_SIZE too small");
+
 /* --- helpers, lock must be held unless noted --- */
 
+/**
+ * @brief Find free client slot.
+ * @param srv Server handle.
+ * @return Slot index or -1 if full. Lock must be held.
+ */
 static int srv_cli_find_free_locked(srv_t srv) {
   for (int i = 0; i < srv->cfg.max_clients; i++) {
     if (!srv->cli[i].in_use) {
@@ -65,6 +86,12 @@ static int srv_cli_find_free_locked(srv_t srv) {
   return -1;
 }
 
+/**
+ * @brief Find client slot by fd.
+ * @param srv Server handle.
+ * @param fd Client socket descriptor.
+ * @return Slot index or -1 if not found. Lock must be held.
+ */
 static int srv_cli_find_by_fd_locked(srv_t srv, int fd) {
   for (int i = 0; i < srv->cfg.max_clients; i++) {
     if (srv->cli[i].in_use && srv->cli[i].fd == fd) {
@@ -75,7 +102,10 @@ static int srv_cli_find_by_fd_locked(srv_t srv, int fd) {
 }
 
 /**
- * @brief Add client, lock must be held. Returns slot index or -1.
+ * @brief Add client, lock must be held.
+ * @param srv Server handle.
+ * @param fd New client socket descriptor.
+ * @return Slot index or -1 if full.
  */
 static int srv_cli_add_locked(srv_t srv, int fd) {
   int idx = srv_cli_find_free_locked(srv);
@@ -84,6 +114,7 @@ static int srv_cli_add_locked(srv_t srv, int fd) {
   }
   srv->cli[idx].fd = fd;
   srv->cli[idx].in_use = true;
+  srv->cli[idx].discarding = false;
   srv->cli[idx].rx_len = 0;
   srv->cli[idx].last_activity = xTaskGetTickCount();
   srv->diag.total_connections++;
@@ -92,8 +123,11 @@ static int srv_cli_add_locked(srv_t srv, int fd) {
 }
 
 /**
- * @brief Remove client, lock must be held. Returns fd to close or -1.
- * Does NOT call on_disconnect, caller must do it after unlocking.
+ * @brief Remove client, lock must be held.
+ * @param srv Server handle.
+ * @param idx Slot index.
+ * @return fd to close or -1. Does NOT call on_disconnect, caller must do it
+ * after unlocking.
  */
 static int srv_cli_remove_locked(srv_t srv, int idx) {
   if (idx < 0 || idx >= srv->cfg.max_clients) {
@@ -112,6 +146,11 @@ static int srv_cli_remove_locked(srv_t srv, int idx) {
   return fd;
 }
 
+/**
+ * @brief Call on_disconnect callback outside lock.
+ * @param srv Server handle.
+ * @param fd Closed client fd, ignored if < 0.
+ */
 static void srv_cli_disconnect_notify(srv_t srv, int fd) {
   if (fd < 0) {
     return;
@@ -125,54 +164,105 @@ static void srv_cli_disconnect_notify(srv_t srv, int fd) {
 
 /**
  * @brief Append data to client RX buffer.
- * @return 0 ok, -1 overflow, line dropped.
+ * @param srv Server handle.
+ * @param idx Client slot index.
+ * @param data Chunk from recv().
+ * @param len Length of @p data.
+ * @return 0 ok, line dropped is also 0, diag is updated internally. Lock must
+ * be held.
  */
 static int srv_cli_append_rx_locked(srv_t srv, int idx, const char *data,
                                     size_t len) {
   srv_cli_t *cli = &srv->cli[idx];
-  if (cli->rx_len + len >= SRV_RX_BUF_SIZE) {
+  srv->diag.rx_bytes += len;
+  cli->last_activity = xTaskGetTickCount();
+  size_t pos = 0;
+  if (cli->discarding) {
+    size_t i = 0;
+    for (; i < len; i++) {
+      if (data[i] == '\n') {
+        break;
+      }
+    }
+    if (i == len) {
+      return 0;
+    }
+    cli->discarding = false;
     cli->rx_len = 0;
+    pos = i + 1;
+    if (pos >= len) {
+      return 0;
+    }
+  }
+  size_t rem_len = len - pos;
+  const char *rem_data = data + pos;
+  if (cli->rx_len + rem_len >= SRV_RX_BUF_SIZE) {
+    cli->rx_len = 0;
+    cli->discarding = true;
     srv->diag.dropped_lines++;
     ESP_LOGW(TAG, "rx overflow fd=%d, line dropped", cli->fd);
-    return -1;
+    for (size_t i = 0; i < rem_len; i++) {
+      if (rem_data[i] == '\n') {
+        cli->discarding = false;
+        size_t after = rem_len - (i + 1);
+        if (after > 0) {
+          memcpy(cli->rx_buf, rem_data + i + 1, after);
+          cli->rx_len = after;
+        }
+        break;
+      }
+    }
+    return 0;
   }
-  memcpy(cli->rx_buf + cli->rx_len, data, len);
-  cli->rx_len += len;
-  cli->last_activity = xTaskGetTickCount();
-  srv->diag.rx_bytes += len;
+  memcpy(cli->rx_buf + cli->rx_len, rem_data, rem_len);
+  cli->rx_len += rem_len;
   return 0;
 }
 
 /**
- * @brief Extract one complete line, without \r\n.
- * @return length of line, 0 if no complete line.
- * Caller must provide out buffer with NUL space.
+ * @brief Extract one complete line, without `\r\n`.
+ * @param srv Server handle.
+ * @param idx Client slot index.
+ * @param out Buffer for line, without `\r\n`, NUL-terminated.
+ * @param out_size Size of @p out, must be >= 1.
+ * @return -1 no complete line, -2 line too long and dropped,
+ *         >=0 length of delivered line, 0 is valid empty line.
+ * Caller must use return value as len, never strlen().
+ * Lock must be held.
  */
-static size_t srv_cli_extract_line_locked(srv_t srv, int idx, char *out,
-                                          size_t out_size) {
+static ssize_t srv_cli_extract_line_locked(srv_t srv, int idx, char *out,
+                                           size_t out_size) {
   srv_cli_t *cli = &srv->cli[idx];
   for (size_t i = 0; i < cli->rx_len; i++) {
-    if (cli->rx_buf[i] == '\n') {
-      size_t line_len = i;
-      if (line_len > 0 && cli->rx_buf[line_len - 1] == '\r') {
-        line_len--;
-      }
-      size_t copy_len = line_len;
-      if (copy_len >= out_size) {
-        copy_len = out_size - 1;
-      }
-      memcpy(out, cli->rx_buf, copy_len);
-      out[copy_len] = '\0';
-      size_t remain = cli->rx_len - (i + 1);
+    if (cli->rx_buf[i] != '\n') {
+      continue;
+    }
+    size_t line_len = i;
+    if (line_len > 0 && cli->rx_buf[line_len - 1] == '\r') {
+      line_len--;
+    }
+    size_t remain = cli->rx_len - (i + 1);
+    if (line_len >= out_size) {
       memmove(cli->rx_buf, cli->rx_buf + i + 1, remain);
       cli->rx_len = remain;
-      srv->diag.rx_lines++;
-      return line_len;
+      srv->diag.dropped_lines++;
+      return -2;
     }
+    memcpy(out, cli->rx_buf, line_len);
+    out[line_len] = '\0';
+    memmove(cli->rx_buf, cli->rx_buf + i + 1, remain);
+    cli->rx_len = remain;
+    srv->diag.rx_lines++;
+    return (ssize_t)line_len;
   }
-  return 0;
+  return -1;
 }
 
+/**
+ * @brief Close clients idle longer than srv_cfg_t.idle_timeout_ms.
+ * @param srv Server handle.
+ * @param now Current tick count from xTaskGetTickCount().
+ */
 static void srv_check_idle(srv_t srv, TickType_t now) {
   if (srv->cfg.idle_timeout_ms == 0) {
     return;
@@ -203,17 +293,19 @@ static void srv_check_idle(srv_t srv, TickType_t now) {
 
 /* --- task internals --- */
 
+/**
+ * @brief Handle readable client sockets from select().
+ * @param srv Server handle.
+ * @param read_fds fd_set from select(), contains listen fd and client fds.
+ */
 static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
-  char tmp[SRV_RECV_TMP_SIZE]; // 256
-  char line[SRV_RX_BUF_SIZE];  // 1024, tylko jeden bufor
+  char tmp[SRV_RECV_TMP_SIZE];
+  char line[SRV_RX_BUF_SIZE];
   int to_close[SRV_MAX_CLIENTS];
   int n_close = 0;
-
   for (int i = 0; i < srv->cfg.max_clients; i++) {
     int fd = -1;
     bool ready = false;
-
-    // 1. Snapshot fd pod lockiem, bez recv
     if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
       continue;
     }
@@ -226,8 +318,6 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
     if (!ready) {
       continue;
     }
-
-    // 2. recv bez locka, socket jest non-blocking i select mówił że gotowy
     int r = recv(fd, tmp, sizeof(tmp), 0);
     if (r == 0) {
       if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -259,8 +349,6 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
       }
       continue;
     }
-
-    // 3. Append pod lockiem
     if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
       continue;
     }
@@ -269,15 +357,10 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
       xSemaphoreGive(srv->lock);
       continue;
     }
-    if (srv_cli_append_rx_locked(srv, idx, tmp, (size_t)r) != 0) {
-      xSemaphoreGive(srv->lock);
-      continue; // overflow, linia zrzucona, klient zostaje
-    }
+    srv_cli_append_rx_locked(srv, idx, tmp, (size_t)r);
     xSemaphoreGive(srv->lock);
-
-    // 4. Wyciągaj linie po jednej, każdą dostarczaj bez locka
     while (1) {
-      size_t line_len = 0;
+      ssize_t r = -1;
       if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
         break;
       }
@@ -286,28 +369,41 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
         xSemaphoreGive(srv->lock);
         break;
       }
-      line_len = srv_cli_extract_line_locked(srv, idx, line, sizeof(line));
+      r = srv_cli_extract_line_locked(srv, idx, line, sizeof(line));
       xSemaphoreGive(srv->lock);
-      if (line_len == 0) {
+      if (r == -1) {
         break;
       }
+      if (r == -2) {
+        continue;
+      }
       if (srv->cfg.on_data) {
-        srv->cfg.on_data(srv->cfg.user_ctx, fd, line, strlen(line));
+        srv->cfg.on_data(srv->cfg.user_ctx, fd, line, (size_t)r);
+      } else {
+        if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+          srv->diag.dropped_lines++;
+          xSemaphoreGive(srv->lock);
+        }
       }
     }
   }
-
   for (int i = 0; i < n_close; i++) {
     close(to_close[i]);
     srv_cli_disconnect_notify(srv, to_close[i]);
   }
 }
 
+/**
+ * @brief srv task, owns listen socket and select() loop.
+ * @param pvParameters Server handle, cast to srv_t.
+ */
 static void srv_task(void *pvParameters) {
   srv_t srv = (srv_t)pvParameters;
   int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
   if (listen_fd < 0) {
     ESP_LOGE(TAG, "socket failed errno=%d", errno);
+    srv->start_ok = false;
+    xSemaphoreGive(srv->started_sem);
     srv->running = false;
     xSemaphoreGive(srv->stopped_sem);
     vTaskDelete(NULL);
@@ -325,6 +421,8 @@ static void srv_task(void *pvParameters) {
     ESP_LOGE(TAG, "bind port %u failed errno=%d", srv->cfg.port, errno);
     close(listen_fd);
     srv->listen_fd = -1;
+    srv->start_ok = false;
+    xSemaphoreGive(srv->started_sem);
     srv->running = false;
     xSemaphoreGive(srv->stopped_sem);
     vTaskDelete(NULL);
@@ -334,6 +432,8 @@ static void srv_task(void *pvParameters) {
     ESP_LOGE(TAG, "listen failed errno=%d", errno);
     close(listen_fd);
     srv->listen_fd = -1;
+    srv->start_ok = false;
+    xSemaphoreGive(srv->started_sem);
     srv->running = false;
     xSemaphoreGive(srv->stopped_sem);
     vTaskDelete(NULL);
@@ -343,6 +443,8 @@ static void srv_task(void *pvParameters) {
   fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
   ESP_LOGI(TAG, "listening on port %u, max %u", srv->cfg.port,
            srv->cfg.max_clients);
+  srv->start_ok = true;
+  xSemaphoreGive(srv->started_sem);
   while (srv->running) {
     fd_set read_fds;
     FD_ZERO(&read_fds);
@@ -380,7 +482,6 @@ static void srv_task(void *pvParameters) {
       srv_check_idle(srv, xTaskGetTickCount());
       continue;
     }
-    // New client.
     if (FD_ISSET(listen_fd, &read_fds)) {
       while (1) {
         struct sockaddr_in cli_addr;
@@ -425,7 +526,6 @@ static void srv_task(void *pvParameters) {
   ESP_LOGI(TAG, "task cleanup");
   close(listen_fd);
   srv->listen_fd = -1;
-  // Close all clients, collect for notify outside lock.
   int to_close[SRV_MAX_CLIENTS];
   int n_close = 0;
   if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -441,38 +541,37 @@ static void srv_task(void *pvParameters) {
     close(to_close[i]);
     srv_cli_disconnect_notify(srv, to_close[i]);
   }
-  srv->handle = NULL;
   srv->running = false;
+  srv->handle = NULL;
   xSemaphoreGive(srv->stopped_sem);
   vTaskDelete(NULL);
 }
 
 /* --- public API --- */
 
-srv_t srv_create(const srv_cfg_t *cfg) {
-  if (!cfg) {
-    return NULL;
+srv_err_t srv_init(srv_handle_storage_t *storage, const srv_cfg_t *cfg,
+                   srv_t *out) {
+  if (!storage || !cfg || !out) {
+    return SRV_ERR_INVALID_ARG;
   }
   if (cfg->port == 0) {
     ESP_LOGE(TAG, "invalid port 0");
-    return NULL;
+    return SRV_ERR_INVALID_ARG;
   }
   if (cfg->max_clients == 0 || cfg->max_clients > SRV_MAX_CLIENTS) {
     ESP_LOGE(TAG, "invalid max_clients %u", cfg->max_clients);
-    return NULL;
+    return SRV_ERR_INVALID_ARG;
   }
   if (cfg->stack_size != 0 && cfg->stack_size != SRV_STACK_SIZE) {
     ESP_LOGE(TAG, "stack_size must be 0 or %d", SRV_STACK_SIZE);
-    return NULL;
+    return SRV_ERR_INVALID_ARG;
   }
   if (cfg->rx_buf_size != 0 && cfg->rx_buf_size != SRV_RX_BUF_SIZE) {
     ESP_LOGE(TAG, "rx_buf_size must be 0 or %d", SRV_RX_BUF_SIZE);
-    return NULL;
+    return SRV_ERR_INVALID_ARG;
   }
-  srv_t srv = (srv_t)calloc(1, sizeof(struct srv_s));
-  if (!srv) {
-    return NULL;
-  }
+  struct srv_s *srv = (struct srv_s *)storage;
+  memset(srv, 0, sizeof(*srv));
   srv->cfg = *cfg;
   if (srv->cfg.backlog <= 0) {
     srv->cfg.backlog = SRV_DEFAULT_BACKLOG;
@@ -483,6 +582,12 @@ srv_t srv_create(const srv_cfg_t *cfg) {
   if (srv->cfg.rx_buf_size == 0) {
     srv->cfg.rx_buf_size = SRV_RX_BUF_SIZE;
   }
+  if (srv->cfg.priority == 0) {
+    srv->cfg.priority = 5;
+  }
+  if (srv->cfg.core_id > 1) {
+    return SRV_ERR_INVALID_ARG;
+  }
   srv->listen_fd = -1;
   srv->running = false;
   srv->handle = NULL;
@@ -491,34 +596,34 @@ srv_t srv_create(const srv_cfg_t *cfg) {
     srv->cli[i].in_use = false;
     srv->cli[i].rx_len = 0;
   }
-  srv->lock = xSemaphoreCreateMutex();
-  if (!srv->lock) {
-    free(srv);
-    return NULL;
+  srv->lock = xSemaphoreCreateMutexStatic(&srv->lock_buf);
+  srv->stopped_sem = xSemaphoreCreateBinaryStatic(&srv->stopped_buf);
+  srv->started_sem = xSemaphoreCreateBinaryStatic(&srv->started_buf);
+  if (!srv->lock || !srv->stopped_sem || !srv->started_sem) {
+    return SRV_ERR_FAIL;
   }
-  srv->stopped_sem = xSemaphoreCreateBinary();
-  if (!srv->stopped_sem) {
-    vSemaphoreDelete(srv->lock);
-    free(srv);
-    return NULL;
-  }
-  return srv;
+  srv->start_ok = false;
+  *out = srv;
+  return SRV_OK;
 }
 
-srv_err_t srv_destroy(srv_t srv) {
+srv_err_t srv_deinit(srv_t srv) {
   if (!srv) {
     return SRV_ERR_INVALID_ARG;
   }
   if (srv->running) {
     srv_stop(srv);
+  } else if (srv->handle != NULL) {
+    xSemaphoreTake(srv->stopped_sem, pdMS_TO_TICKS(SRV_STOP_TIMEOUT_MS));
+    srv->handle = NULL;
   }
-  if (srv->lock) {
-    vSemaphoreDelete(srv->lock);
-  }
-  if (srv->stopped_sem) {
-    vSemaphoreDelete(srv->stopped_sem);
-  }
-  free(srv);
+  srv->lock = NULL;
+  srv->stopped_sem = NULL;
+  srv->started_sem = NULL;
+  srv->handle = NULL;
+  srv->listen_fd = -1;
+  srv->running = false;
+  srv->start_ok = false;
   return SRV_OK;
 }
 
@@ -526,11 +631,15 @@ srv_err_t srv_start(srv_t srv) {
   if (!srv) {
     return SRV_ERR_INVALID_ARG;
   }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
+    return SRV_ERR_INVALID_ARG;
+  }
   if (srv->running) {
     return SRV_ERR_ALREADY_STARTED;
   }
-  // Drain stopped_sem from previous run, so stop() does not take stale signal.
   xSemaphoreTake(srv->stopped_sem, 0);
+  xSemaphoreTake(srv->started_sem, 0);
+  srv->start_ok = false;
   srv->running = true;
   srv->handle = xTaskCreateStaticPinnedToCore(
       srv_task, "srv", SRV_STACK_DEPTH, srv, srv->cfg.priority, srv->stack,
@@ -540,11 +649,30 @@ srv_err_t srv_start(srv_t srv) {
     ESP_LOGE(TAG, "xTaskCreateStatic failed");
     return SRV_ERR_FAIL;
   }
+  if (xSemaphoreTake(srv->started_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    ESP_LOGE(TAG, "srv task did not report start");
+    srv->running = false;
+    if (srv->listen_fd != -1) {
+      shutdown(srv->listen_fd, SHUT_RDWR);
+    }
+    xSemaphoreTake(srv->stopped_sem, pdMS_TO_TICKS(1000));
+    srv->handle = NULL;
+    return SRV_ERR_FAIL;
+  }
+  if (!srv->start_ok) {
+    xSemaphoreTake(srv->stopped_sem, pdMS_TO_TICKS(1000));
+    srv->running = false;
+    srv->handle = NULL;
+    return SRV_ERR_FAIL;
+  }
   return SRV_OK;
 }
 
 srv_err_t srv_stop(srv_t srv) {
   if (!srv) {
+    return SRV_ERR_INVALID_ARG;
+  }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
     return SRV_ERR_INVALID_ARG;
   }
   if (!srv->running) {
@@ -559,6 +687,7 @@ srv_err_t srv_stop(srv_t srv) {
     ESP_LOGE(TAG, "srv task did not exit in %d ms", SRV_STOP_TIMEOUT_MS);
     return SRV_ERR_FAIL;
   }
+  srv->handle = NULL;
   return SRV_OK;
 }
 
@@ -573,6 +702,9 @@ srv_err_t srv_send_to(srv_t srv, int fd, const char *data, size_t len) {
   if (!srv || !data || len == 0) {
     return SRV_ERR_INVALID_ARG;
   }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
+    return SRV_ERR_INVALID_ARG;
+  }
   if (!srv->running) {
     return SRV_ERR_NOT_STARTED;
   }
@@ -585,7 +717,6 @@ srv_err_t srv_send_to(srv_t srv, int fd, const char *data, size_t len) {
     return SRV_ERR_NO_CLIENT;
   }
   int send_fd = srv->cli[idx].fd;
-  // Non-blocking send, hold lock only for short send.
   int n = send(send_fd, data, len, 0);
   srv_err_t ret = SRV_OK;
   int fd_to_close = -1;
@@ -601,7 +732,7 @@ srv_err_t srv_send_to(srv_t srv, int fd, const char *data, size_t len) {
     srv->diag.tx_bytes += (uint32_t)n;
     srv->cli[idx].last_activity = xTaskGetTickCount();
     if ((size_t)n < len) {
-      ret = SRV_ERR_WOULD_BLOCK; // partial, caller may retry
+      ret = SRV_ERR_WOULD_BLOCK;
     }
   }
   xSemaphoreGive(srv->lock);
@@ -614,6 +745,9 @@ srv_err_t srv_send_to(srv_t srv, int fd, const char *data, size_t len) {
 
 srv_err_t srv_send_all(srv_t srv, const char *data, size_t len) {
   if (!srv || !data || len == 0) {
+    return SRV_ERR_INVALID_ARG;
+  }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
     return SRV_ERR_INVALID_ARG;
   }
   if (!srv->running) {
@@ -656,20 +790,26 @@ srv_err_t srv_send_all(srv_t srv, const char *data, size_t len) {
   return SRV_OK;
 }
 
-srv_diag_t srv_get_diag(srv_t srv) {
-  srv_diag_t empty = {0};
-  if (!srv) {
-    return empty;
+srv_err_t srv_get_diag(srv_t srv, srv_diag_t *out) {
+  if (!srv || !out) {
+    return SRV_ERR_INVALID_ARG;
   }
-  if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-    empty = srv->diag;
-    xSemaphoreGive(srv->lock);
+  if (!srv->lock) {
+    return SRV_ERR_INVALID_ARG;
   }
-  return empty;
+  if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+    return SRV_ERR_FAIL;
+  }
+  *out = srv->diag;
+  xSemaphoreGive(srv->lock);
+  return SRV_OK;
 }
 
 srv_err_t srv_reset_diag(srv_t srv) {
   if (!srv) {
+    return SRV_ERR_INVALID_ARG;
+  }
+  if (!srv->lock || !srv->started_sem || !srv->stopped_sem) {
     return SRV_ERR_INVALID_ARG;
   }
   if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -680,4 +820,27 @@ srv_err_t srv_reset_diag(srv_t srv) {
   srv->diag.current_clients = cur;
   xSemaphoreGive(srv->lock);
   return SRV_OK;
+}
+
+const char *srv_err_to_str(srv_err_t err) {
+  switch (err) {
+  case SRV_OK:
+    return "OK";
+  case SRV_ERR_INVALID_ARG:
+    return "INVALID_ARG";
+  case SRV_ERR_FAIL:
+    return "FAIL";
+  case SRV_ERR_NO_MEM:
+    return "NO_MEM";
+  case SRV_ERR_ALREADY_STARTED:
+    return "ALREADY_STARTED";
+  case SRV_ERR_NOT_STARTED:
+    return "NOT_STARTED";
+  case SRV_ERR_NO_CLIENT:
+    return "NO_CLIENT";
+  case SRV_ERR_WOULD_BLOCK:
+    return "WOULD_BLOCK";
+  default:
+    return "UNKNOWN";
+  }
 }

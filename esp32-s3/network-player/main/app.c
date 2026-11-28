@@ -670,3 +670,41 @@ int app_send_cmd(const app_cmd_t *cmd) {
   }
   return xQueueSend(s_queue, cmd, pdMS_TO_TICKS(20)) == pdTRUE ? 0 : -1;
 }
+
+int app_player_config(dec_codec_t codec, uint32_t rate, uint8_t channels,
+                      uint8_t bits) {
+  xEventGroupClearBits(g_app_sync_evt,
+                       EVT_PLAYER_READY); // <-- przed wysłaniem!
+  player_cmd_t cmd = {.type = PLAYER_CMD_CONFIG,
+                      .codec = codec,
+                      .rate = rate,
+                      .channels = channels,
+                      .bits = bits};
+  if (player_send_cmd(&cmd) != 0)
+    return -1;
+  return app_wait_ack(EVT_PLAYER_READY, pdMS_TO_TICKS(2000));
+}
+
+int app_player_play(void) {
+  xEventGroupClearBits(g_app_sync_evt, EVT_PLAYER_PLAYING);
+  player_cmd_t cmd = {.type = PLAYER_CMD_PLAY};
+  if (player_send_cmd(&cmd) != 0)
+    return -1;
+  return app_wait_ack(EVT_PLAYER_PLAYING, pdMS_TO_TICKS(2000));
+}
+
+int app_player_stop(void) {
+  xEventGroupClearBits(g_app_sync_evt, EVT_PLAYER_STOPPED);
+  player_cmd_t cmd = {.type = PLAYER_CMD_STOP};
+  if (player_send_cmd(&cmd) != 0)
+    return -1;
+  return app_wait_ack(EVT_PLAYER_STOPPED, pdMS_TO_TICKS(2000));
+}
+
+int app_player_shutdown(void) {
+  xEventGroupClearBits(g_app_sync_evt, EVT_PLAYER_STOPPED);
+  player_cmd_t cmd = {.type = PLAYER_CMD_SHUTDOWN};
+  if (player_send_cmd(&cmd) != 0)
+    return -1;
+  return app_wait_ack(EVT_PLAYER_STOPPED, pdMS_TO_TICKS(2000));
+}
