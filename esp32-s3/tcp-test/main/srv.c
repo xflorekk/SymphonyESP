@@ -3,6 +3,15 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+/**
+ * @file srv.c
+ * @brief TCP line server implementation, static allocation.
+ *
+ * @details Single srv task owns listen socket, select() loop and client
+ * RX buffers. srv_send_to() / srv_send_all() may be called from any task,
+ * they use the same mutex as the task. All state lives in
+ * srv_handle_storage_t provided by the app, no heap allocation.
+ */
 #include "srv.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -63,6 +72,11 @@ _Static_assert(sizeof(struct srv_s) <= sizeof(srv_handle_storage_t),
 
 /* --- helpers, lock must be held unless noted --- */
 
+/**
+ * @brief Find free client slot.
+ * @param srv Server handle.
+ * @return Slot index or -1 if full. Lock must be held.
+ */
 static int srv_cli_find_free_locked(srv_t srv) {
   for (int i = 0; i < srv->cfg.max_clients; i++) {
     if (!srv->cli[i].in_use) {
@@ -72,6 +86,12 @@ static int srv_cli_find_free_locked(srv_t srv) {
   return -1;
 }
 
+/**
+ * @brief Find client slot by fd.
+ * @param srv Server handle.
+ * @param fd Client socket descriptor.
+ * @return Slot index or -1 if not found. Lock must be held.
+ */
 static int srv_cli_find_by_fd_locked(srv_t srv, int fd) {
   for (int i = 0; i < srv->cfg.max_clients; i++) {
     if (srv->cli[i].in_use && srv->cli[i].fd == fd) {
@@ -82,7 +102,10 @@ static int srv_cli_find_by_fd_locked(srv_t srv, int fd) {
 }
 
 /**
- * @brief Add client, lock must be held. Returns slot index or -1.
+ * @brief Add client, lock must be held.
+ * @param srv Server handle.
+ * @param fd New client socket descriptor.
+ * @return Slot index or -1 if full.
  */
 static int srv_cli_add_locked(srv_t srv, int fd) {
   int idx = srv_cli_find_free_locked(srv);
@@ -100,8 +123,11 @@ static int srv_cli_add_locked(srv_t srv, int fd) {
 }
 
 /**
- * @brief Remove client, lock must be held. Returns fd to close or -1.
- * Does NOT call on_disconnect, caller must do it after unlocking.
+ * @brief Remove client, lock must be held.
+ * @param srv Server handle.
+ * @param idx Slot index.
+ * @return fd to close or -1. Does NOT call on_disconnect, caller must do it
+ * after unlocking.
  */
 static int srv_cli_remove_locked(srv_t srv, int idx) {
   if (idx < 0 || idx >= srv->cfg.max_clients) {
@@ -120,6 +146,11 @@ static int srv_cli_remove_locked(srv_t srv, int idx) {
   return fd;
 }
 
+/**
+ * @brief Call on_disconnect callback outside lock.
+ * @param srv Server handle.
+ * @param fd Closed client fd, ignored if < 0.
+ */
 static void srv_cli_disconnect_notify(srv_t srv, int fd) {
   if (fd < 0) {
     return;
@@ -133,16 +164,19 @@ static void srv_cli_disconnect_notify(srv_t srv, int fd) {
 
 /**
  * @brief Append data to client RX buffer.
- * @return 0 ok, -1 overflow, line dropped.
+ * @param srv Server handle.
+ * @param idx Client slot index.
+ * @param data Chunk from recv().
+ * @param len Length of @p data.
+ * @return 0 ok, line dropped is also 0, diag is updated internally. Lock must
+ * be held.
  */
 static int srv_cli_append_rx_locked(srv_t srv, int idx, const char *data,
                                     size_t len) {
   srv_cli_t *cli = &srv->cli[idx];
   srv->diag.rx_bytes += len;
   cli->last_activity = xTaskGetTickCount();
-
   size_t pos = 0;
-  // 1. Jak zrzucamy poprzednią za długą linię, szukaj \n w nowym chunku
   if (cli->discarding) {
     size_t i = 0;
     for (; i < len; i++) {
@@ -151,9 +185,8 @@ static int srv_cli_append_rx_locked(srv_t srv, int idx, const char *data,
       }
     }
     if (i == len) {
-      return 0; // dalej brak \n, zrzuć cały chunk
+      return 0;
     }
-    // Koniec zrzucanej linii, reszta po \n to początek nowej linii
     cli->discarding = false;
     cli->rx_len = 0;
     pos = i + 1;
@@ -161,23 +194,18 @@ static int srv_cli_append_rx_locked(srv_t srv, int idx, const char *data,
       return 0;
     }
   }
-
-  // 2. Normalny append dla reszty data[pos..]
   size_t rem_len = len - pos;
   const char *rem_data = data + pos;
   if (cli->rx_len + rem_len >= SRV_RX_BUF_SIZE) {
-    // Overflow, zacznij zrzucać aż do \n
     cli->rx_len = 0;
     cli->discarding = true;
     srv->diag.dropped_lines++;
     ESP_LOGW(TAG, "rx overflow fd=%d, line dropped", cli->fd);
-    // Może ten sam chunk zawiera \n kończący długą linię?
     for (size_t i = 0; i < rem_len; i++) {
       if (rem_data[i] == '\n') {
         cli->discarding = false;
         size_t after = rem_len - (i + 1);
         if (after > 0) {
-          // after < 256, na pewno się mieści bo rx_len == 0
           memcpy(cli->rx_buf, rem_data + i + 1, after);
           cli->rx_len = after;
         }
@@ -186,17 +214,21 @@ static int srv_cli_append_rx_locked(srv_t srv, int idx, const char *data,
     }
     return 0;
   }
-
   memcpy(cli->rx_buf + cli->rx_len, rem_data, rem_len);
   cli->rx_len += rem_len;
   return 0;
 }
 
 /**
- * @brief Extract one complete line, without \r\n.
+ * @brief Extract one complete line, without `\r\n`.
+ * @param srv Server handle.
+ * @param idx Client slot index.
+ * @param out Buffer for line, without `\r\n`, NUL-terminated.
+ * @param out_size Size of @p out, must be >= 1.
  * @return -1 no complete line, -2 line too long and dropped,
  *         >=0 length of delivered line, 0 is valid empty line.
  * Caller must use return value as len, never strlen().
+ * Lock must be held.
  */
 static ssize_t srv_cli_extract_line_locked(srv_t srv, int idx, char *out,
                                            size_t out_size) {
@@ -211,7 +243,6 @@ static ssize_t srv_cli_extract_line_locked(srv_t srv, int idx, char *out,
     }
     size_t remain = cli->rx_len - (i + 1);
     if (line_len >= out_size) {
-      // Too long, drop whole line, do not deliver truncated copy.
       memmove(cli->rx_buf, cli->rx_buf + i + 1, remain);
       cli->rx_len = remain;
       srv->diag.dropped_lines++;
@@ -222,11 +253,16 @@ static ssize_t srv_cli_extract_line_locked(srv_t srv, int idx, char *out,
     memmove(cli->rx_buf, cli->rx_buf + i + 1, remain);
     cli->rx_len = remain;
     srv->diag.rx_lines++;
-    return (ssize_t)line_len; // 0 = empty line, valid
+    return (ssize_t)line_len;
   }
-  return -1; // no complete line
+  return -1;
 }
 
+/**
+ * @brief Close clients idle longer than srv_cfg_t.idle_timeout_ms.
+ * @param srv Server handle.
+ * @param now Current tick count from xTaskGetTickCount().
+ */
 static void srv_check_idle(srv_t srv, TickType_t now) {
   if (srv->cfg.idle_timeout_ms == 0) {
     return;
@@ -257,17 +293,19 @@ static void srv_check_idle(srv_t srv, TickType_t now) {
 
 /* --- task internals --- */
 
+/**
+ * @brief Handle readable client sockets from select().
+ * @param srv Server handle.
+ * @param read_fds fd_set from select(), contains listen fd and client fds.
+ */
 static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
-  char tmp[SRV_RECV_TMP_SIZE]; // 256
-  char line[SRV_RX_BUF_SIZE];  // 1024, tylko jeden bufor
+  char tmp[SRV_RECV_TMP_SIZE];
+  char line[SRV_RX_BUF_SIZE];
   int to_close[SRV_MAX_CLIENTS];
   int n_close = 0;
-
   for (int i = 0; i < srv->cfg.max_clients; i++) {
     int fd = -1;
     bool ready = false;
-
-    // 1. Snapshot fd pod lockiem, bez recv
     if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
       continue;
     }
@@ -280,8 +318,6 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
     if (!ready) {
       continue;
     }
-
-    // 2. recv bez locka, socket jest non-blocking i select mówił że gotowy
     int r = recv(fd, tmp, sizeof(tmp), 0);
     if (r == 0) {
       if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -313,8 +349,6 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
       }
       continue;
     }
-
-    // 3. Append pod lockiem
     if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
       continue;
     }
@@ -325,8 +359,6 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
     }
     srv_cli_append_rx_locked(srv, idx, tmp, (size_t)r);
     xSemaphoreGive(srv->lock);
-
-    // 4. Extract lines one by one, deliver without lock
     while (1) {
       ssize_t r = -1;
       if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -340,16 +372,14 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
       r = srv_cli_extract_line_locked(srv, idx, line, sizeof(line));
       xSemaphoreGive(srv->lock);
       if (r == -1) {
-        break; // no complete line
+        break;
       }
       if (r == -2) {
-        continue; // too long, dropped, try next line in same buffer
+        continue;
       }
-      // r >= 0, 0 = empty line, valid, deliver it
       if (srv->cfg.on_data) {
         srv->cfg.on_data(srv->cfg.user_ctx, fd, line, (size_t)r);
       } else {
-        // Extracted but no consumer, count as dropped
         if (xSemaphoreTake(srv->lock, pdMS_TO_TICKS(100)) == pdTRUE) {
           srv->diag.dropped_lines++;
           xSemaphoreGive(srv->lock);
@@ -357,13 +387,16 @@ static void srv_handle_cli(srv_t srv, fd_set *read_fds) {
       }
     }
   }
-
   for (int i = 0; i < n_close; i++) {
     close(to_close[i]);
     srv_cli_disconnect_notify(srv, to_close[i]);
   }
 }
 
+/**
+ * @brief srv task, owns listen socket and select() loop.
+ * @param pvParameters Server handle, cast to srv_t.
+ */
 static void srv_task(void *pvParameters) {
   srv_t srv = (srv_t)pvParameters;
   int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
@@ -376,7 +409,6 @@ static void srv_task(void *pvParameters) {
     vTaskDelete(NULL);
     return;
   }
-
   srv->listen_fd = listen_fd;
   int opt = 1;
   setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -385,7 +417,6 @@ static void srv_task(void *pvParameters) {
   srv_addr.sin_family = AF_INET;
   srv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
   srv_addr.sin_port = htons(srv->cfg.port);
-
   if (bind(listen_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) != 0) {
     ESP_LOGE(TAG, "bind port %u failed errno=%d", srv->cfg.port, errno);
     close(listen_fd);
@@ -397,7 +428,6 @@ static void srv_task(void *pvParameters) {
     vTaskDelete(NULL);
     return;
   }
-
   if (listen(listen_fd, srv->cfg.backlog) != 0) {
     ESP_LOGE(TAG, "listen failed errno=%d", errno);
     close(listen_fd);
@@ -409,15 +439,12 @@ static void srv_task(void *pvParameters) {
     vTaskDelete(NULL);
     return;
   }
-
   int flags = fcntl(listen_fd, F_GETFL, 0);
   fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
-
   ESP_LOGI(TAG, "listening on port %u, max %u", srv->cfg.port,
            srv->cfg.max_clients);
   srv->start_ok = true;
   xSemaphoreGive(srv->started_sem);
-
   while (srv->running) {
     fd_set read_fds;
     FD_ZERO(&read_fds);
@@ -455,7 +482,6 @@ static void srv_task(void *pvParameters) {
       srv_check_idle(srv, xTaskGetTickCount());
       continue;
     }
-    // New client.
     if (FD_ISSET(listen_fd, &read_fds)) {
       while (1) {
         struct sockaddr_in cli_addr;
@@ -691,7 +717,6 @@ srv_err_t srv_send_to(srv_t srv, int fd, const char *data, size_t len) {
     return SRV_ERR_NO_CLIENT;
   }
   int send_fd = srv->cli[idx].fd;
-  // Non-blocking send, hold lock only for short send.
   int n = send(send_fd, data, len, 0);
   srv_err_t ret = SRV_OK;
   int fd_to_close = -1;
@@ -707,7 +732,7 @@ srv_err_t srv_send_to(srv_t srv, int fd, const char *data, size_t len) {
     srv->diag.tx_bytes += (uint32_t)n;
     srv->cli[idx].last_activity = xTaskGetTickCount();
     if ((size_t)n < len) {
-      ret = SRV_ERR_WOULD_BLOCK; // partial, caller may retry
+      ret = SRV_ERR_WOULD_BLOCK;
     }
   }
   xSemaphoreGive(srv->lock);
